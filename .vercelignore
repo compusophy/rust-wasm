@@ -1,0 +1,11 @@
+# Ignore source and build config
+src/
+target/
+Cargo.toml
+Cargo.lock
+build.sh
+.gitignore
+
+# Ensure pkg is NOT ignored (even if it is in gitignore)
+!pkg/
+
