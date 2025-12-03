@@ -1,20 +1,15 @@
 use tokio::net::{TcpListener, TcpStream};
 use futures_util::{StreamExt, SinkExt};
 use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message;
 use std::env;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
-
-type Db = Arc<Mutex<HashMap<String, String>>>;
 
 #[tokio::main]
 async fn main() {
-    // Railway provides the PORT environment variable
     let port = env::var("PORT").unwrap_or_else(|_| "9001".to_string());
     let addr = format!("0.0.0.0:{}", port);
 
-    // Create a broadcast channel for chat messages
     let (tx, _rx) = broadcast::channel(100);
 
     let listener = TcpListener::bind(&addr).await.expect("Failed to bind");
@@ -36,34 +31,40 @@ async fn handle_connection(stream: TcpStream, tx: broadcast::Sender<String>) {
     };
 
     let (mut write, mut read) = ws_stream.split();
-    
-    // Subscribe to the broadcast channel
     let mut rx = tx.subscribe();
 
-    // Spawn a task to forward broadcast messages to this client
+    // Heartbeat interval
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
+
     let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if write.send(tokio_tungstenite::tungstenite::Message::Text(msg)).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                Ok(msg) = rx.recv() => {
+                    if write.send(Message::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    // Send Ping to keep connection alive
+                    if write.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
-    // Process incoming messages from this client
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = read.next().await {
             if msg.is_text() {
                 let text = msg.to_text().unwrap();
-                // Broadcast the message to all subscribers
                 let _ = tx.send(text.to_string());
             }
         }
     });
 
-    // Wait for either task to finish (connection closed or error)
     tokio::select! {
         _ = (&mut send_task) => recv_task.abort(),
         _ = (&mut recv_task) => send_task.abort(),
     };
 }
-
