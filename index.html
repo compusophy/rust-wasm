@@ -6,21 +6,78 @@
     <title>Rust + Wasm Chat</title>
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
-        #chat-messages { height: 300px; overflow-y: scroll; border: 1px solid #ccc; margin-bottom: 10px; padding: 10px; }
-        .chat-container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        body { margin: 0; font-family: sans-serif; }
+        
+        .chat-container { 
+            position: fixed; 
+            bottom: 20px; 
+            left: 20px; 
+            width: 300px; 
+            background: white; 
+            border: 1px solid #ccc; 
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            padding: 0;
+            overflow: hidden;
+            z-index: 1000;
+        }
+
+        .chat-header {
+            background: #333;
+            color: white;
+            padding: 10px;
+            font-weight: bold;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        #connection-status {
+            font-size: 0.8em;
+            margin-left: 10px;
+        }
+
+        .status-connected { color: #4caf50; }
+        .status-disconnected { color: #f44336; }
+
+        #chat-messages { 
+            height: 250px; 
+            overflow-y: auto; 
+            padding: 10px;
+            background: #f9f9f9;
+        }
+
+        .chat-input-area {
+            padding: 10px;
+            border-top: 1px solid #eee;
+            display: flex;
+            gap: 5px;
+        }
+
+        #message-input { flex-grow: 1; padding: 5px; }
+        #send-btn { padding: 5px 10px; }
     </style>
 </head>
 <body>
+    <!-- Main content of the page would go here -->
+    <div style="padding: 50px;">
+        <h1>Welcome to Temty</h1>
+        <p>This is the main content area. The chat is fixed to the bottom left.</p>
+    </div>
+
     <div class="chat-container">
-        <h1>Rust Wasm Chat</h1>
-        
-        <div id="connection-status">Connecting...</div>
+        <div class="chat-header">
+            <span>Global Chat</span>
+            <span id="connection-status">Connecting...</span>
+        </div>
         
         <div id="chat-messages"></div>
         
-        <div style="display: flex; gap: 10px;">
-            <input type="text" id="message-input" placeholder="Type a message..." style="flex-grow: 1;">
-            <button onclick="sendMessage()">Send</button>
+        <div class="chat-input-area">
+            <input type="text" id="message-input" placeholder="Type a message..." disabled>
+            <button id="send-btn" onclick="sendMessage()" disabled>Send</button>
         </div>
     </div>
 
@@ -28,35 +85,63 @@
         import init, { ChatClient } from './pkg/temty.js';
 
         let client;
+        const statusEl = document.getElementById('connection-status');
+        const inputEl = document.getElementById('message-input');
+        const btnEl = document.getElementById('send-btn');
+
+        function setConnected(connected) {
+            if (connected) {
+                statusEl.innerText = 'Connected';
+                statusEl.className = 'status-connected';
+                inputEl.disabled = false;
+                btnEl.disabled = false;
+            } else {
+                statusEl.innerText = 'Disconnected - Refresh to reconnect';
+                statusEl.className = 'status-disconnected';
+                inputEl.disabled = true;
+                btnEl.disabled = true;
+            }
+        }
 
         async function run() {
             await init();
             
-            // In production, this URL will come from env vars or be hardcoded to your Railway URL
-            // For local dev: ws://localhost:9001
-            // For production: wss://your-app.up.railway.app
+            // For production: wss://temty-server-production.up.railway.app
             const wsUrl = window.location.hostname === 'localhost' 
                 ? 'ws://localhost:9001' 
-                : 'wss://temty-production.up.railway.app'; // REPLACE WITH YOUR RAILWAY URL
+                : 'wss://temty-server-production.up.railway.app';
 
             try {
                 client = new ChatClient(wsUrl);
-                document.getElementById('connection-status').innerText = 'Connected to ' + wsUrl;
+                // Note: We assume connected if no error, but real app should wait for 'open' event
+                setConnected(true);
             } catch (e) {
-                document.getElementById('connection-status').innerText = 'Connection failed: ' + e;
+                statusEl.innerText = 'Connection failed: ' + e;
             }
 
-            // Expose send function globally
+            // Monkey-patch the log function to detect errors/close from Rust side
+            // (Ideally we'd expose a callback from Rust, but this is a quick fix)
+            const originalLog = console.log;
+            console.log = (...args) => {
+                originalLog(...args);
+                if (args[0] && typeof args[0] === 'string' && args[0].includes('WebSocket error')) {
+                    setConnected(false);
+                }
+            };
+
             window.sendMessage = () => {
-                const input = document.getElementById('message-input');
-                if (input.value && client) {
-                    client.send_message(input.value);
-                    input.value = '';
+                if (inputEl.value && client) {
+                    try {
+                        client.send_message(inputEl.value);
+                        inputEl.value = '';
+                    } catch (e) {
+                        console.error(e);
+                        setConnected(false);
+                    }
                 }
             };
             
-            // Allow Enter key to send
-            document.getElementById('message-input').addEventListener('keypress', (e) => {
+            inputEl.addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') window.sendMessage();
             });
         }
