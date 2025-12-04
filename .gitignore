@@ -1,5 +1,5 @@
-/target
-/pkg
+target/
+pkg/
 **/*.rs.bk
 
 .vercel
