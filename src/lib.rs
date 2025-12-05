@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::Clamped;
-use web_sys::{WebSocket, HtmlCanvasElement, CanvasRenderingContext2d, ImageData, MouseEvent, WheelEvent, MessageEvent};
+use web_sys::{WebSocket, HtmlCanvasElement, CanvasRenderingContext2d, ImageData, MouseEvent, WheelEvent, TouchEvent, MessageEvent};
 use serde::{Serialize, Deserialize};
 
 // --- IMPORTS & LOGGING ---
@@ -20,18 +20,30 @@ extern "C" {
 // --- NETWORK PROTOCOL ---
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct PlayerInfo {
-    id: u32,
+    id: i32,
     chunk_x: i32,
     chunk_y: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+struct UnitDTO {
+    owner_id: i32,
+    unit_idx: usize,
+    x: f32,
+    y: f32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 enum GameMessage {
-    Welcome { player_id: u32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo> },
+    Join { version: u32, token: Option<String> },
+    Welcome { player_id: i32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo>, units: Vec<UnitDTO>, token: String },
     NewPlayer { player: PlayerInfo },
-    PlayerMove { player_id: u32, x: f32, y: f32 },
+    UnitMove { player_id: i32, unit_idx: usize, x: f32, y: f32 },
+    Error { message: String },
 }
+
+const CLIENT_VERSION: u32 = 7;
 
 // --- CHAT CLIENT ---
 #[wasm_bindgen]
@@ -46,15 +58,18 @@ impl ChatClient {
         let ws = WebSocket::new(url)?;
         Ok(ChatClient { socket: ws })
     }
+    pub fn send_message_str(&self, msg: &str) -> Result<(), JsValue> {
+        self.socket.send_with_str(msg)
+    }
     pub fn send_message(&self, msg: &str) -> Result<(), JsValue> {
         self.socket.send_with_str(msg)
     }
 }
 
 // --- PIXEL BUFFER ENGINE ---
-const WIDTH: u32 = 800;
-const HEIGHT: u32 = 600;
-const CHUNK_SIZE: i32 = 32;
+const WIDTH: u32 = 360;
+const HEIGHT: u32 = 640;
+const CHUNK_SIZE: i32 = 64; // User requested 64x64 plot per player
 const TILE_SIZE_BASE: f32 = 16.0;
 
 struct PixelBuffer {
@@ -177,12 +192,14 @@ struct Unit {
     selected: bool,
     kind: u8,
     color: (u8, u8, u8),
+    owner_id: i32, // Synced Owner ID
 }
 
 struct Building {
     tile_x: i32, // Global Tile Pos
     tile_y: i32,
     kind: u8,
+    owner_id: i32, // Added owner tracking for coloring
 }
 
 struct Chunk {
@@ -200,10 +217,16 @@ struct GameState {
     zoom: f32,
 
     // Multiplayer State
-    my_id: Option<u32>,
+    my_id: Option<i32>,
     my_chunk_x: i32,
     my_chunk_y: i32,
     other_players: Vec<PlayerInfo>,
+    socket: Option<WebSocket>, // For sending commands
+
+    // Input State
+    last_touch_dist: Option<f32>,
+    last_pan_x: Option<f32>,
+    last_pan_y: Option<f32>,
 }
 
 impl GameState {
@@ -219,6 +242,10 @@ impl GameState {
             my_chunk_x: 0,
             my_chunk_y: 0,
             other_players: Vec::new(),
+            socket: None,
+            last_touch_dist: None,
+            last_pan_x: None,
+            last_pan_y: None,
         };
 
         // Generate Initial Chunk (0,0)
@@ -228,18 +255,30 @@ impl GameState {
         gs.camera_x = (CHUNK_SIZE as f32 * TILE_SIZE_BASE) / 2.0;
         gs.camera_y = (CHUNK_SIZE as f32 * TILE_SIZE_BASE) / 2.0;
 
-        // Place Town Center at 0,0 chunk center
-        let cx = CHUNK_SIZE / 2;
-        let cy = CHUNK_SIZE / 2;
-        gs.buildings.push(Building { tile_x: cx, tile_y: cy, kind: 0 });
-
-        // Add Villagers
-        let sx = (cx as f32 * TILE_SIZE_BASE) as f32;
-        let sy = (cy as f32 * TILE_SIZE_BASE) as f32;
-        gs.units.push(Unit { x: sx + 30.0, y: sy + 30.0, path: Vec::new(), selected: false, kind: 0, color: (0, 0, 255) });
-        gs.units.push(Unit { x: sx - 20.0, y: sy + 40.0, path: Vec::new(), selected: false, kind: 0, color: (0, 0, 255) });
-
+        // Place Town Center at the assigned chunk center
+        // Since we don't know our ID yet, we can't place the building correctly in new().
+        // We will handle building placement in Welcome/NewPlayer messages.
+        
         gs
+    }
+
+    fn spawn_units_for_player(&mut self, pid: i32, cx: i32, cy: i32) {
+        let sx = (cx as f32 * CHUNK_SIZE as f32 * TILE_SIZE_BASE) + (CHUNK_SIZE as f32 * TILE_SIZE_BASE / 2.0);
+        let sy = (cy as f32 * CHUNK_SIZE as f32 * TILE_SIZE_BASE) + (CHUNK_SIZE as f32 * TILE_SIZE_BASE / 2.0);
+        
+        let color = if Some(pid) == self.my_id { (0, 0, 255) } else { (255, 0, 0) };
+        
+        self.units.push(Unit { x: sx + 30.0, y: sy + 30.0, path: Vec::new(), selected: false, kind: 0, color, owner_id: pid });
+        self.units.push(Unit { x: sx - 20.0, y: sy + 40.0, path: Vec::new(), selected: false, kind: 0, color, owner_id: pid });
+        
+        // Spawn Building for this player
+        let mid = CHUNK_SIZE / 2;
+        self.buildings.push(Building { 
+            tile_x: cx * CHUNK_SIZE + mid, 
+            tile_y: cy * CHUNK_SIZE + mid, 
+            kind: 0,
+            owner_id: pid 
+        });
     }
 
     fn generate_chunk(&mut self, cx: i32, cy: i32) {
@@ -249,22 +288,27 @@ impl GameState {
         for y in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 let idx = (y * CHUNK_SIZE + x) as usize;
-                let r = random();
-                if r < 0.1 { tiles[idx] = TileType::Water; }
+                // Pseudo-random seed based on coordinates for consistency
+                let seed = ((cx as i64 * 73856093) ^ (cy as i64 * 19349663) ^ (x as i64 * 83492791) ^ (y as i64 * 23492871)) as f64;
+                let r = (seed.sin() * 10000.0).fract().abs();
+                
+                // Reduced water frequency from 0.1 to 0.03
+                if r < 0.03 { tiles[idx] = TileType::Water; }
                 else if r < 0.25 { tiles[idx] = TileType::Forest; }
                 else if r < 0.28 { tiles[idx] = TileType::Mountain; }
                 else if r < 0.30 { tiles[idx] = TileType::Gold; }
             }
         }
         
-        // Ensure walkability for Town Center if at 0,0
-        if cx == 0 && cy == 0 {
-            let mid = CHUNK_SIZE / 2;
-            for y in (mid-2)..(mid+3) {
-                for x in (mid-2)..(mid+3) {
-                    if x < CHUNK_SIZE && y < CHUNK_SIZE {
-                        tiles[(y * CHUNK_SIZE + x) as usize] = TileType::Grass;
-                    }
+        // Ensure walkability for Town Center (simplified: clear center of ANY chunk where a player spawns)
+        // Center is at CHUNK_SIZE / 2
+        let mid = CHUNK_SIZE / 2;
+        
+        // Clear a 5x5 area in the center for Building + Units
+        for y in (mid-3)..(mid+4) {
+            for x in (mid-3)..(mid+4) {
+                if x >= 0 && x < CHUNK_SIZE && y >= 0 && y < CHUNK_SIZE {
+                    tiles[(y * CHUNK_SIZE + x) as usize] = TileType::Grass;
                 }
             }
         }
@@ -473,14 +517,19 @@ impl GameState {
 
     fn handle_click(&mut self, screen_x: f32, screen_y: f32) {
         let (wx, wy) = self.screen_to_world(screen_x, screen_y);
+        let my_id = if let Some(id) = self.my_id { id } else { return };
 
         let mut clicked_unit = false;
-        // Check unit click (approximate radius 10/zoom?)
-        // Actually units are drawn at world pos, so check world pos
         
         for unit in &mut self.units {
-            // Unit hit box approx 16x16
-            if wx >= unit.x - 5.0 && wx <= unit.x + 15.0 && wy >= unit.y - 5.0 && wy <= unit.y + 15.0 {
+            if unit.owner_id != my_id { continue; }
+
+            // Unit hit box approx 16x16 (radius 8)
+            let dx = (unit.x - wx).abs();
+            let dy = (unit.y - wy).abs();
+            
+            // Check if click is within 10 units of center
+            if dx < 10.0 && dy < 10.0 {
                 unit.selected = !unit.selected;
                 clicked_unit = true;
                 break;
@@ -490,22 +539,99 @@ impl GameState {
         if !clicked_unit {
             // Move command
             let mut paths = Vec::new();
+            let mut move_commands = Vec::new();
+            
+            // First, calculate paths for local update
             for (i, unit) in self.units.iter().enumerate() {
-                if unit.selected {
+                if unit.selected && unit.owner_id == my_id {
                     let path = self.find_path((unit.x, unit.y), (wx, wy));
-                    paths.push((i, path));
+                    if !path.is_empty() {
+                        paths.push((i, path));
+                        
+                        // Calculate relative index for this unit within my units
+                        let mut my_unit_idx = 0;
+                        for (k, u) in self.units.iter().enumerate() {
+                            if u.owner_id == my_id {
+                                if k == i { break; }
+                                my_unit_idx += 1;
+                            }
+                        }
+                        
+                        move_commands.push((my_unit_idx, wx, wy));
+                    }
                 }
             }
+            
+            // Update local state
             for (i, path) in paths {
                 self.units[i].path = path;
+            }
+            
+            // Send commands
+            if let Some(ws) = &self.socket {
+                for (idx, tx, ty) in move_commands {
+                    let msg = GameMessage::UnitMove { 
+                        player_id: my_id, 
+                        unit_idx: idx, 
+                        x: tx, 
+                        y: ty 
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = ws.send_with_str(&json);
+                    }
+                }
             }
         }
     }
     
-    fn handle_zoom(&mut self, delta_y: f32) {
+    fn handle_zoom(&mut self, delta_y: f32, mouse_x: f32, mouse_y: f32) {
+        // 1. Project mouse screen coords to world coords *before* zoom
+        let (world_x, world_y) = self.screen_to_world(mouse_x, mouse_y);
+
+        // 2. Apply Zoom
         let sensitivity = 0.001;
         let new_zoom = self.zoom - delta_y * sensitivity;
-        self.zoom = new_zoom.clamp(0.2, 4.0);
+        // Allow infinite zoom out practically (0.01)
+        let new_zoom = new_zoom.clamp(0.01, 10.0);
+        
+        if (new_zoom - self.zoom).abs() < 0.0001 { return; }
+        self.zoom = new_zoom;
+
+        // 3. We want (world_x, world_y) to still be under (mouse_x, mouse_y)
+        // New World calc: (screen - center) / new_zoom + new_cam = world
+        // Therefore: new_cam = world - (screen - center) / new_zoom
+        
+        let center_x = WIDTH as f32 / 2.0;
+        let center_y = HEIGHT as f32 / 2.0;
+        
+        self.camera_x = world_x - (mouse_x - center_x) / self.zoom;
+        self.camera_y = world_y - (mouse_y - center_y) / self.zoom;
+    }
+
+    fn handle_touch_zoom(&mut self, dist: f32, center_x: f32, center_y: f32) {
+        if let Some(last_dist) = self.last_touch_dist {
+            let delta = last_dist - dist;
+            // Scale delta for zoom sensitivity
+            self.handle_zoom(delta * 5.0, center_x, center_y);
+        }
+        self.last_touch_dist = Some(dist);
+    }
+
+    fn handle_pan(&mut self, screen_x: f32, screen_y: f32) {
+        if let (Some(lx), Some(ly)) = (self.last_pan_x, self.last_pan_y) {
+            let dx = (screen_x - lx) / self.zoom;
+            let dy = (screen_y - ly) / self.zoom;
+            self.camera_x -= dx;
+            self.camera_y -= dy;
+        }
+        self.last_pan_x = Some(screen_x);
+        self.last_pan_y = Some(screen_y);
+    }
+
+    fn end_touch(&mut self) {
+        self.last_touch_dist = None;
+        self.last_pan_x = None;
+        self.last_pan_y = None;
     }
 }
 
@@ -532,6 +658,26 @@ pub fn run_game() -> Result<(), JsValue> {
 
     // --- WEBSOCKET ---
     let ws = WebSocket::new("wss://temty-server-production.up.railway.app").expect("Failed to connect to WS");
+    
+    // Assign Socket to GameState
+    game_state.borrow_mut().socket = Some(ws.clone());
+
+    // OnOpen - Send Handshake
+    {
+        let ws_clone = ws.clone();
+        let onopen_callback = Closure::wrap(Box::new(move || {
+             // Get token from localStorage
+             let window = web_sys::window().unwrap();
+             let storage = window.local_storage().unwrap().unwrap();
+             let token = storage.get_item("temty_token").unwrap_or(None);
+             
+             let msg = serde_json::to_string(&GameMessage::Join { version: CLIENT_VERSION, token }).unwrap();
+             ws_clone.send_with_str(&msg).expect("Failed to send Join message");
+        }) as Box<dyn FnMut()>);
+        ws.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
+        onopen_callback.forget();
+    }
+
     {
         let gs = game_state.clone();
         let onmessage_callback = Closure::wrap(Box::new(move |e: MessageEvent| {
@@ -540,28 +686,129 @@ pub fn run_game() -> Result<(), JsValue> {
                 if let Ok(msg) = serde_json::from_str::<GameMessage>(&txt) {
                     let mut state = gs.borrow_mut();
                     match msg {
-                        GameMessage::Welcome { player_id, chunk_x, chunk_y, players } => {
+                        GameMessage::Join { .. } => {}, 
+                        GameMessage::Error { message } => {
+                            log(&format!("Server Error: {}", message));
+                            web_sys::window().unwrap().alert_with_message(&message).unwrap();
+                        },
+                        GameMessage::Welcome { player_id, chunk_x, chunk_y, players, units, token } => {
                             state.my_id = Some(player_id);
                             state.my_chunk_x = chunk_x;
                             state.my_chunk_y = chunk_y;
-                            state.other_players = players;
+                            state.other_players = players.clone();
                             
-                            // Ensure initial chunk exists
-                            state.generate_chunk(chunk_x, chunk_y);
+                            // Save Token
+                            let window = web_sys::window().unwrap();
+                            let storage = window.local_storage().unwrap().unwrap();
+                            storage.set_item("temty_token", &token).unwrap();
                             
-                            // Move camera to this chunk
+                            // Ensure chunks exist and spawn buildings for ALL players (me + others)
+                            // Note: players includes existing players. Does it include me? 
+                            // Server logic: "existing_players" = values of map BEFORE inserting me (Wait, check server code)
+                            // Server: 
+                            //   gs.players.insert(me); 
+                            //   existing_players = gs.players.values().collect();
+                            // So YES, "players" list in Welcome includes ME.
+                            
+                            state.buildings.clear(); // Clear buildings to avoid dupes if any
+                            
+                            for p in &players {
+                                state.generate_chunk(p.chunk_x, p.chunk_y);
+                                
+                                // Spawn Building
+                                let mid = CHUNK_SIZE / 2;
+                                state.buildings.push(Building { 
+                                    tile_x: p.chunk_x * CHUNK_SIZE + mid, 
+                                    tile_y: p.chunk_y * CHUNK_SIZE + mid, 
+                                    kind: 0,
+                                    owner_id: p.id
+                                });
+                            }
+                            
+                            // Move camera to my chunk
                             state.camera_x = (chunk_x as f32 * CHUNK_SIZE as f32 * TILE_SIZE_BASE) + (CHUNK_SIZE as f32 * TILE_SIZE_BASE / 2.0);
                             state.camera_y = (chunk_y as f32 * CHUNK_SIZE as f32 * TILE_SIZE_BASE) + (CHUNK_SIZE as f32 * TILE_SIZE_BASE / 2.0);
                             
+                            // Reset Units and Load from Server
+                            state.units.clear();
+                            
+                            for u in units {
+                                let color = if Some(u.owner_id) == state.my_id { (0, 0, 255) } else { (255, 0, 0) };
+                                state.units.push(Unit {
+                                    x: u.x,
+                                    y: u.y,
+                                    path: Vec::new(), // Server doesn't sync path, units appear idle
+                                    selected: false,
+                                    kind: 0,
+                                    color,
+                                    owner_id: u.owner_id,
+                                });
+                            }
+
                             log(&format!("Welcome! Assigned to Chunk ({}, {})", chunk_x, chunk_y));
                         },
                         GameMessage::NewPlayer { player } => {
+                            // Ignore if it's me (already handled in Welcome)
+                            if Some(player.id) == state.my_id {
+                                return;
+                            }
+                            
                             log(&format!("New Player joined at ({}, {})", player.chunk_x, player.chunk_y));
-                            // Generate/Track the new player's chunk
                             state.generate_chunk(player.chunk_x, player.chunk_y);
-                            state.other_players.push(player);
+                            state.other_players.push(player.clone());
+                            state.spawn_units_for_player(player.id, player.chunk_x, player.chunk_y);
                         },
-                        GameMessage::PlayerMove { .. } => {}
+                        GameMessage::UnitMove { player_id, unit_idx, x, y } => {
+                            if Some(player_id) != state.my_id {
+                                // Find the unit
+                                let mut count = 0;
+                                let mut target_unit_idx = None;
+                                
+                                for (i, u) in state.units.iter().enumerate() {
+                                    if u.owner_id == player_id {
+                                        if count == unit_idx {
+                                            target_unit_idx = Some(i);
+                                            break;
+                                        }
+                                        count += 1;
+                                    }
+                                }
+                                
+                                if let Some(idx) = target_unit_idx {
+                                    let start_x = state.units[idx].x;
+                                    let start_y = state.units[idx].y;
+
+                                    // CRITICAL FIX: Ensure chunks exist for the path!
+                                    let min_wx = start_x.min(x);
+                                    let min_wy = start_y.min(y);
+                                    let max_wx = start_x.max(x);
+                                    let max_wy = start_y.max(y);
+
+                                    let min_cx = (min_wx / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+                                    let min_cy = (min_wy / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+                                    let max_cx = (max_wx / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+                                    let max_cy = (max_wy / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+
+                                    // Expand by 1 chunk padding
+                                    for cy in (min_cy - 1)..=(max_cy + 1) {
+                                        for cx in (min_cx - 1)..=(max_cx + 1) {
+                                            if !state.chunks.contains_key(&(cx, cy)) {
+                                                state.generate_chunk(cx, cy);
+                                            }
+                                        }
+                                    }
+
+                                    let path = state.find_path((start_x, start_y), (x, y));
+                                    state.units[idx].path = path;
+                                    
+                                    // Teleport fallback to prevent desync
+                                    if state.units[idx].path.is_empty() {
+                                        state.units[idx].x = x;
+                                        state.units[idx].y = y;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -574,6 +821,22 @@ pub fn run_game() -> Result<(), JsValue> {
     {
         let gs = game_state.clone();
         let closure = Closure::wrap(Box::new(move |event: MouseEvent| {
+            let mut gs = gs.borrow_mut();
+            if event.buttons() == 1 {
+                gs.handle_pan(event.offset_x() as f32, event.offset_y() as f32);
+            } else {
+                gs.last_pan_x = Some(event.offset_x() as f32);
+                gs.last_pan_y = Some(event.offset_y() as f32);
+            }
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("mousemove", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+    
+    {
+        let gs = game_state.clone();
+        let closure = Closure::wrap(Box::new(move |event: MouseEvent| {
+            gs.borrow_mut().end_touch(); // Reset pan state
             gs.borrow_mut().handle_click(event.offset_x() as f32, event.offset_y() as f32);
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())?;
@@ -581,13 +844,68 @@ pub fn run_game() -> Result<(), JsValue> {
     }
     {
         let gs = game_state.clone();
+        let closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+            gs.borrow_mut().end_touch();
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+    {
+        let gs = game_state.clone();
+        let closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+            gs.borrow_mut().end_touch();
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("mouseleave", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
+    {
+        let gs = game_state.clone();
         let closure = Closure::wrap(Box::new(move |event: WheelEvent| {
             event.prevent_default();
-            gs.borrow_mut().handle_zoom(event.delta_y() as f32);
+            gs.borrow_mut().handle_zoom(event.delta_y() as f32, event.offset_x() as f32, event.offset_y() as f32);
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("wheel", closure.as_ref().unchecked_ref())?;
         closure.forget();
     }
+    
+    // --- TOUCH INPUT (Mobile Zoom & Pan) ---
+    {
+        let gs = game_state.clone();
+        let closure = Closure::wrap(Box::new(move |event: TouchEvent| {
+            let touches = event.touches();
+            if touches.length() == 2 {
+                event.prevent_default(); 
+                let t1 = touches.get(0).unwrap();
+                let t2 = touches.get(1).unwrap();
+                
+                let dx = (t1.client_x() - t2.client_x()).abs() as f32;
+                let dy = (t1.client_y() - t2.client_y()).abs() as f32;
+                let dist = (dx*dx + dy*dy).sqrt();
+                
+                let cx = (t1.client_x() + t2.client_x()) as f32 / 2.0;
+                let cy = (t1.client_y() + t2.client_y()) as f32 / 2.0;
+                
+                gs.borrow_mut().handle_touch_zoom(dist, cx, cy);
+            } else if touches.length() == 1 {
+                // Pan
+                event.prevent_default();
+                let t = touches.get(0).unwrap();
+                gs.borrow_mut().handle_pan(t.client_x() as f32, t.client_y() as f32);
+            }
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("touchmove", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+    {
+        let gs = game_state.clone();
+        let closure = Closure::wrap(Box::new(move |_event: TouchEvent| {
+             gs.borrow_mut().end_touch();
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("touchend", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
 
     // --- RENDER LOOP ---
     let f = Rc::new(RefCell::new(None));
@@ -608,7 +926,6 @@ pub fn run_game() -> Result<(), JsValue> {
         let screen_center_y = HEIGHT as f32 / 2.0;
 
         // Determine visible area
-        // Viewport World Rect: [cam_x - W/2/z, cam_x + W/2/z]
         let view_w = WIDTH as f32 / zoom;
         let view_h = HEIGHT as f32 / zoom;
         let view_min_x = cam_x - view_w / 2.0;
@@ -625,6 +942,7 @@ pub fn run_game() -> Result<(), JsValue> {
         // Render Chunks
         for cy in min_cy..=max_cy {
             for cx in min_cx..=max_cx {
+                // Only render if chunk exists in our known world (created by player spawns)
                 if let Some(chunk) = gs.chunks.get(&(cx, cy)) {
                     let chunk_world_x = cx as f32 * CHUNK_SIZE as f32 * TILE_SIZE_BASE;
                     let chunk_world_y = cy as f32 * CHUNK_SIZE as f32 * TILE_SIZE_BASE;
@@ -661,6 +979,9 @@ pub fn run_game() -> Result<(), JsValue> {
                             }
                         }
                     }
+                } else {
+                    // Void (Black) - do nothing or draw black rect
+                    // buffer is cleared to (20,20,20) so it's already dark grey
                 }
             }
         }
@@ -674,7 +995,10 @@ pub fn run_game() -> Result<(), JsValue> {
             let sy = (by - cam_y) * zoom + screen_center_y;
             let size = tile_size * 1.5;
 
-            buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, 160, 82, 45);
+            // Color logic: Blue for me, Red for enemy
+            let color = if Some(b.owner_id) == gs.my_id { (0, 0, 255) } else { (255, 0, 0) };
+            
+            buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, color.0, color.1, color.2);
         }
 
         // Render Units
@@ -682,28 +1006,37 @@ pub fn run_game() -> Result<(), JsValue> {
             let sx = (u.x - cam_x) * zoom + screen_center_x;
             let sy = (u.y - cam_y) * zoom + screen_center_y;
             
-            if u.selected {
-                let box_size = tile_size * 1.2;
-                buffer.rect_outline((sx - 2.0) as i32, (sy - 2.0) as i32, box_size as i32, box_size as i32, 0, 255, 0);
+            // Only render if on screen
+            if sx > -50.0 && sx < WIDTH as f32 + 50.0 && sy > -50.0 && sy < HEIGHT as f32 + 50.0 {
+                let w = tile_size * 0.6;
                 
-                // Path
-                if !u.path.is_empty() {
-                    let mut prev_sx = sx as i32 + 3;
-                    let mut prev_sy = sy as i32 + 3;
+                // Draw Unit Center (Offset by half width to center it on x,y)
+                let unit_draw_x = sx - w/2.0;
+                let unit_draw_y = sy - w/2.0;
+
+                if u.selected {
+                    let box_size = tile_size * 1.2;
+                    // Center selection box on x,y
+                    buffer.rect_outline((sx - box_size/2.0) as i32, (sy - box_size/2.0) as i32, box_size as i32, box_size as i32, 0, 255, 0);
                     
-                    for point in u.path.iter().rev() {
-                        let p_sx = ((point.0 - cam_x) * zoom + screen_center_x) as i32;
-                        let p_sy = ((point.1 - cam_y) * zoom + screen_center_y) as i32;
+                    // Path
+                    if !u.path.is_empty() {
+                        let mut prev_sx = sx as i32;
+                        let mut prev_sy = sy as i32;
                         
-                        buffer.line(prev_sx, prev_sy, p_sx, p_sy, 255, 255, 255, true);
-                        prev_sx = p_sx;
-                        prev_sy = p_sy;
+                        for point in u.path.iter().rev() {
+                            let p_sx = ((point.0 - cam_x) * zoom + screen_center_x) as i32;
+                            let p_sy = ((point.1 - cam_y) * zoom + screen_center_y) as i32;
+                            
+                            buffer.line(prev_sx, prev_sy, p_sx, p_sy, 255, 255, 255, true);
+                            prev_sx = p_sx;
+                            prev_sy = p_sy;
+                        }
                     }
                 }
+                
+                buffer.rect(unit_draw_x as i32, unit_draw_y as i32, w as i32, w as i32, u.color.0, u.color.1, u.color.2);
             }
-            
-            let w = tile_size * 0.6;
-            buffer.rect(sx as i32, sy as i32, w as i32, w as i32, u.color.0, u.color.1, u.color.2);
         }
 
         // HUD / Debug Info
@@ -713,7 +1046,7 @@ pub fn run_game() -> Result<(), JsValue> {
         let status_color = if gs.my_id.is_some() { (0, 255, 0) } else { (100, 100, 100) };
         buffer.rect(10, 10, 10, 10, status_color.0, status_color.1, status_color.2);
 
-        // Display other players
+        // Display other players (Red Dots) - Still useful for debugging
         for p in &gs.other_players {
              let cx = p.chunk_x;
              let cy = p.chunk_y;
@@ -725,7 +1058,7 @@ pub fn run_game() -> Result<(), JsValue> {
              let sy = (py - cam_y) * zoom + screen_center_y;
              
              let size = tile_size * 0.8;
-             buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, 255, 0, 0);
+             // buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, 255, 0, 0);
         }
 
         let image_data = ImageData::new_with_u8_clamped_array_and_sh(
