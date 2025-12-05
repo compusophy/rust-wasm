@@ -689,7 +689,32 @@ pub fn run_game() -> Result<(), JsValue> {
                         GameMessage::Join { .. } => {}, 
                         GameMessage::Error { message } => {
                             log(&format!("Server Error: {}", message));
-                            web_sys::window().unwrap().alert_with_message(&message).unwrap();
+                            
+                            // Specific handling for version errors
+                            if message.contains("Client version") && message.contains("too old") {
+                                let window = web_sys::window().unwrap();
+                                let document = window.document().unwrap();
+                                let body = document.body().unwrap();
+                                
+                                let overlay = document.create_element("div").unwrap();
+                                overlay.set_attribute("style", "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.9);color:red;display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:9999;font-size:24px;text-align:center;padding:20px;").unwrap();
+                                
+                                overlay.set_inner_html(r#"
+                                    <div>⚠️ CLIENT OUTDATED ⚠️</div>
+                                    <div style="color:white;font-size:16px;margin-top:10px;">A new version of the game is available.</div>
+                                    <div style="color:#aaa;font-size:14px;margin-top:5px;">Please refresh your browser to update.</div>
+                                    <button onclick="location.reload(true)" style="margin-top:20px;padding:10px 20px;font-size:18px;cursor:pointer;">Update Now</button>
+                                "#);
+                                
+                                body.append_child(&overlay).unwrap();
+                                
+                                // Stop the game loop
+                                // We can't easily stop the requestAnimationFrame loop from here without structure changes,
+                                // but the overlay blocks interaction. Ideally we'd set a flag in GameState.
+                                state.my_id = None; // Disable input processing by removing ID
+                            } else {
+                                web_sys::window().unwrap().alert_with_message(&message).unwrap();
+                            }
                         },
                         GameMessage::Welcome { player_id, chunk_x, chunk_y, players, units, token } => {
                             state.my_id = Some(player_id);
