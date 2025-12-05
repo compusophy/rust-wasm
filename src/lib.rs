@@ -57,7 +57,7 @@ enum GameMessage {
     Error { message: String },
 }
 
-const CLIENT_VERSION: u32 = 19;
+const CLIENT_VERSION: u32 = 20;
 
 // --- CHAT CLIENT ---
 #[wasm_bindgen]
@@ -245,6 +245,16 @@ struct GameState {
     // Selection
     selected_building: Option<usize>,
     
+    // Double-click detection
+    last_click_time: f64,
+    last_click_x: f32,
+    last_click_y: f32,
+    
+    // Group/Drag Selection
+    group_select_mode: bool,
+    drag_start: Option<(f32, f32)>,  // Screen coords
+    drag_current: Option<(f32, f32)>, // Screen coords
+    
     // Sync
     last_sync_time: f64,
     
@@ -270,6 +280,12 @@ impl GameState {
             last_pan_x: None,
             last_pan_y: None,
             selected_building: None,
+            last_click_time: 0.0,
+            last_click_x: 0.0,
+            last_click_y: 0.0,
+            group_select_mode: false,
+            drag_start: None,
+            drag_current: None,
             last_sync_time: 0.0,
             target_zoom: 1.0,
         };
@@ -658,104 +674,92 @@ impl GameState {
     fn handle_click(&mut self, screen_x: f32, screen_y: f32) {
         let my_id = if let Some(id) = self.my_id { id } else { return };
         
+        // Get current time for double-click detection
+        let now = web_sys::window().unwrap().performance().unwrap().now();
+        
         // --- UI CLICK HANDLING ---
-        let footer_height = 100.0;
+        let footer_height = 60.0; // Reduced from 100
         if screen_y > HEIGHT as f32 - footer_height {
             // Click is in Footer
             
             // 1. Check Home Button (Center)
-            let home_btn_size = 60.0;
-            let home_btn_x = (WIDTH as f32 - home_btn_size) / 2.0;
-            let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - home_btn_size) / 2.0;
+            let btn_size = 40.0;
+            let home_btn_x = (WIDTH as f32 - btn_size) / 2.0;
+            let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - btn_size) / 2.0;
             
-            if screen_x >= home_btn_x && screen_x <= home_btn_x + home_btn_size &&
-               screen_y >= home_btn_y && screen_y <= home_btn_y + home_btn_size {
+            if screen_x >= home_btn_x && screen_x <= home_btn_x + btn_size &&
+               screen_y >= home_btn_y && screen_y <= home_btn_y + btn_size {
                    
                    // Select Town Center
                    for (i, b) in self.buildings.iter().enumerate() {
-                       if b.owner_id == my_id {
+                       if b.owner_id == my_id && b.kind == 0 {
                            self.selected_building = Some(i);
-                           // Deselect units
                            for u in &mut self.units { u.selected = false; }
                            
-                           // Center Camera
                            let bx = b.tile_x as f32 * TILE_SIZE_BASE;
                            let by = b.tile_y as f32 * TILE_SIZE_BASE;
-                           
-                           // We want bx, by to be at center of screen
-                           // World = (Screen - Center)/Zoom + Camera
-                           // Camera = World - (Screen - Center)/Zoom
-                           // Camera = bx - 0 (since screen center is center)
-                           
-                           // Reset Zoom for "Home" feel? Or keep current zoom?
-                           // User said "like on page load". Page load defaults to zoom 1.0.
-                           // Let's reset zoom to 1.0 for consistent "Home" behavior.
                            self.target_zoom = 1.0;
-                           
-                           // We need to set camera AFTER zoom stabilizes or calculate for target zoom?
-                           // If we just set camera to bx, by, it centers 0,0 of world to center of screen?
-                           // No, camera_x/y is the world coordinate at the CENTER of the screen.
                            self.camera_x = bx;
                            self.camera_y = by;
-                           
                            break;
                        }
                    }
                    return;
             }
+            
+            // 2. Check Group Select Button (Right of Home)
+            let group_btn_x = home_btn_x + btn_size + 10.0;
+            let group_btn_y = home_btn_y;
+            
+            if screen_x >= group_btn_x && screen_x <= group_btn_x + btn_size &&
+               screen_y >= group_btn_y && screen_y <= group_btn_y + btn_size {
+                self.group_select_mode = !self.group_select_mode;
+                return;
+            }
 
-            // 2. Check Spawn Button (Left) - Only if building selected
+            // 3. Check Spawn Button (Left) - Only if building selected
             if let Some(b_idx) = self.selected_building {
-                // Only if Town Center
                 if b_idx < self.buildings.len() && self.buildings[b_idx].kind == 0 {
-                    let spawn_btn_size = 60.0;
-                    let spawn_btn_x = 20.0;
-                    let spawn_btn_y = HEIGHT as f32 - footer_height + (footer_height - spawn_btn_size) / 2.0;
+                    let spawn_btn_x = 10.0;
+                    let spawn_btn_y = home_btn_y;
                     
-                    if screen_x >= spawn_btn_x && screen_x <= spawn_btn_x + spawn_btn_size &&
-                       screen_y >= spawn_btn_y && screen_y <= spawn_btn_y + spawn_btn_size {
-                           
-                        // Send Spawn Request
+                    if screen_x >= spawn_btn_x && screen_x <= spawn_btn_x + btn_size &&
+                       screen_y >= spawn_btn_y && screen_y <= spawn_btn_y + btn_size {
                         if let Some(ws) = &self.socket {
                              let msg = GameMessage::SpawnUnit;
                              if let Ok(json) = serde_json::to_string(&msg) {
                                  let _ = ws.send_with_str(&json);
                              }
                         }
+                        return;
                     }
                 }
             }
             
-            // 3. Check Build Wall Button (Left) - Only if unit selected AND no building selected
+            // 4. Check Build Wall Button (Left) - Only if unit selected AND no building selected
             if self.selected_building.is_none() {
-                let mut selected_unit_idx = None;
-                for (i, u) in self.units.iter().enumerate() {
-                    if u.selected && Some(u.owner_id) == Some(my_id) {
-                        selected_unit_idx = Some(i);
-                        break;
-                    }
-                }
-                
-                if let Some(idx) = selected_unit_idx {
-                    let build_btn_size = 60.0;
-                    let build_btn_x = 20.0;
-                    let build_btn_y = HEIGHT as f32 - footer_height + (footer_height - build_btn_size) / 2.0;
+                let any_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
+                if any_selected {
+                    let build_btn_x = 10.0;
+                    let build_btn_y = home_btn_y;
                     
-                    if screen_x >= build_btn_x && screen_x <= build_btn_x + build_btn_size &&
-                       screen_y >= build_btn_y && screen_y <= build_btn_y + build_btn_size {
-                           
-                        // Build Wall at Unit Location (Snapped to Grid)
-                        let u = &self.units[idx];
-                        let tx = (u.x / TILE_SIZE_BASE).floor() as i32;
-                        let ty = (u.y / TILE_SIZE_BASE).floor() as i32;
-                        
-                        // Send Build Request
-                        if let Some(ws) = &self.socket {
-                             let msg = GameMessage::Build { kind: 1, tile_x: tx, tile_y: ty };
-                             if let Ok(json) = serde_json::to_string(&msg) {
-                                 let _ = ws.send_with_str(&json);
-                             }
+                    if screen_x >= build_btn_x && screen_x <= build_btn_x + btn_size &&
+                       screen_y >= build_btn_y && screen_y <= build_btn_y + btn_size {
+                        // Find first selected unit for build location
+                        for u in &self.units {
+                            if u.selected && u.owner_id == my_id {
+                                let tx = (u.x / TILE_SIZE_BASE).floor() as i32;
+                                let ty = (u.y / TILE_SIZE_BASE).floor() as i32;
+                                if let Some(ws) = &self.socket {
+                                     let msg = GameMessage::Build { kind: 1, tile_x: tx, tile_y: ty };
+                                     if let Ok(json) = serde_json::to_string(&msg) {
+                                         let _ = ws.send_with_str(&json);
+                                     }
+                                }
+                                break;
+                            }
                         }
+                        return;
                     }
                 }
             }
@@ -764,23 +768,43 @@ impl GameState {
         
         // --- WORLD CLICK HANDLING ---
         let (wx, wy) = self.screen_to_world(screen_x, screen_y);
+        
+        // Double-click detection (300ms window, 20px tolerance)
+        let is_double_click = (now - self.last_click_time) < 300.0 &&
+                              (screen_x - self.last_click_x).abs() < 20.0 &&
+                              (screen_y - self.last_click_y).abs() < 20.0;
+        
+        self.last_click_time = now;
+        self.last_click_x = screen_x;
+        self.last_click_y = screen_y;
 
+        let mut clicked_unit_kind: Option<u8> = None;
         let mut clicked_unit = false;
         
         // 1. Try Select Unit
         for unit in &mut self.units {
             if unit.owner_id != my_id { continue; }
 
-            // Unit hit box approx 16x16 (radius 8)
             let dx = (unit.x - wx).abs();
             let dy = (unit.y - wy).abs();
             
-            // Check if click is within 10 units of center
             if dx < 10.0 && dy < 10.0 {
                 unit.selected = !unit.selected;
                 clicked_unit = true;
-                self.selected_building = None; // Deselect building
+                clicked_unit_kind = Some(unit.kind);
+                self.selected_building = None;
                 break;
+            }
+        }
+        
+        // Double-click: select all units of same type
+        if clicked_unit && is_double_click {
+            if let Some(kind) = clicked_unit_kind {
+                for unit in &mut self.units {
+                    if unit.owner_id == my_id && unit.kind == kind {
+                        unit.selected = true;
+                    }
+                }
             }
         }
 
@@ -792,36 +816,27 @@ impl GameState {
                 
                 let bx = b.tile_x as f32 * TILE_SIZE_BASE;
                 let by = b.tile_y as f32 * TILE_SIZE_BASE;
-                let size = TILE_SIZE_BASE * 2.5; // Increased hitbox from 1.5 to 2.5 for easier selection
+                let size = TILE_SIZE_BASE * 1.5;
                 
-                // Hitbox centered on building
                 if wx >= bx - size/2.0 && wx <= bx + size/2.0 &&
                    wy >= by - size/2.0 && wy <= by + size/2.0 {
                        self.selected_building = Some(i);
                        clicked_building = true;
-                       
-                       // Deselect all units
                        for u in &mut self.units { u.selected = false; }
                        break;
                    }
             }
             
             if !clicked_building {
-                // Clear selections if clicking empty ground (unless moving units)
-                // If units are selected, we Move. If not, we clear building selection.
-                
                 let any_unit_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
                 
                 if !any_unit_selected {
                     self.selected_building = None;
                 } else {
-                    // Move command logic...
-                    // ... (existing move logic) ...
-                    
+                    // Move selected units
                     let mut paths = Vec::new();
                     let mut move_commands = Vec::new();
                     
-                    // Collect selected unit data first to avoid borrowing conflict
                     let mut selected_units = Vec::new();
                     for (i, unit) in self.units.iter().enumerate() {
                         if unit.selected && unit.owner_id == my_id {
@@ -829,13 +844,11 @@ impl GameState {
                         }
                     }
         
-                    // Now calculate paths (mut borrow ok here)
                     for (i, start_x, start_y) in selected_units {
                         let path = self.find_path((start_x, start_y), (wx, wy));
                         if !path.is_empty() {
                             paths.push((i, path));
                             
-                            // Calculate relative index for this unit within my units
                             let mut my_unit_idx = 0;
                             for (k, u) in self.units.iter().enumerate() {
                                 if u.owner_id == my_id {
@@ -843,17 +856,14 @@ impl GameState {
                                     my_unit_idx += 1;
                                 }
                             }
-                            
                             move_commands.push((my_unit_idx, wx, wy));
                         }
                     }
                     
-                    // Update local state
                     for (i, path) in paths {
                         self.units[i].path = path;
                     }
                     
-                    // Send commands
                     if let Some(ws) = &self.socket {
                         for (idx, tx, ty) in move_commands {
                             let msg = GameMessage::UnitMove { 
@@ -870,6 +880,52 @@ impl GameState {
                 }
             }
         }
+    }
+    
+    fn handle_drag_start(&mut self, screen_x: f32, screen_y: f32) {
+        if self.group_select_mode {
+            self.drag_start = Some((screen_x, screen_y));
+            self.drag_current = Some((screen_x, screen_y));
+        }
+    }
+    
+    fn handle_drag_move(&mut self, screen_x: f32, screen_y: f32) {
+        if self.group_select_mode && self.drag_start.is_some() {
+            self.drag_current = Some((screen_x, screen_y));
+        }
+    }
+    
+    fn handle_drag_end(&mut self) {
+        if let (Some(start), Some(end)) = (self.drag_start, self.drag_current) {
+            let my_id = if let Some(id) = self.my_id { id } else { 
+                self.drag_start = None;
+                self.drag_current = None;
+                return;
+            };
+            
+            // Convert screen coords to world coords
+            let (wx1, wy1) = self.screen_to_world(start.0, start.1);
+            let (wx2, wy2) = self.screen_to_world(end.0, end.1);
+            
+            let min_x = wx1.min(wx2);
+            let max_x = wx1.max(wx2);
+            let min_y = wy1.min(wy2);
+            let max_y = wy1.max(wy2);
+            
+            // Select all units in the rectangle
+            for unit in &mut self.units {
+                if unit.owner_id != my_id { continue; }
+                
+                if unit.x >= min_x && unit.x <= max_x && unit.y >= min_y && unit.y <= max_y {
+                    unit.selected = !unit.selected; // Toggle like regular click
+                }
+            }
+            
+            self.selected_building = None;
+        }
+        
+        self.drag_start = None;
+        self.drag_current = None;
     }
     
     fn handle_zoom(&mut self, delta_y: f32, mouse_x: f32, mouse_y: f32) {
@@ -989,23 +1045,9 @@ pub fn run_game() -> Result<(), JsValue> {
     // OnClose - Handle disconnection (likely due to server restart/update)
     {
         let onclose_callback = Closure::wrap(Box::new(move || {
-            log("WS Disconnected. Attempting to reload for update check...");
-            // If server disconnected us, it might be an update.
-            // Reloading the page is the safest way to get new WASM and reconnect.
-            // But we don't want infinite reload loops if server is just down.
-            // For now, let's just show the "Disconnected" status, but maybe a "Reconnecting..." banner?
-            // User asked for "checking if min version matches".
-            
-            // If we just reload, we get the new client.
-            // Let's try a delayed reload.
-            let window = web_sys::window().unwrap();
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                &Closure::wrap(Box::new(move || {
-                    let window = web_sys::window().unwrap();
-                    let _ = window.location().reload();
-                }) as Box<dyn FnMut()>).into_js_value().unchecked_ref(),
-                5000 // Reload after 5 seconds of disconnect
-            );
+            log("WS Disconnected.");
+            // Don't auto-reload - it causes unsettling screen flashes.
+            // User can manually refresh if needed.
         }) as Box<dyn FnMut()>);
         ws.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
         onclose_callback.forget();
@@ -1232,11 +1274,16 @@ pub fn run_game() -> Result<(), JsValue> {
         let gs = game_state.clone();
         let closure = Closure::wrap(Box::new(move |event: MouseEvent| {
             let mut gs = gs.borrow_mut();
-            if event.buttons() == 1 {
-                gs.handle_pan(event.offset_x() as f32, event.offset_y() as f32);
+            let x = event.offset_x() as f32;
+            let y = event.offset_y() as f32;
+            
+            if gs.group_select_mode && gs.drag_start.is_some() {
+                gs.handle_drag_move(x, y);
+            } else if event.buttons() == 1 {
+                gs.handle_pan(x, y);
             } else {
-                gs.last_pan_x = Some(event.offset_x() as f32);
-                gs.last_pan_y = Some(event.offset_y() as f32);
+                gs.last_pan_x = Some(x);
+                gs.last_pan_y = Some(y);
             }
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("mousemove", closure.as_ref().unchecked_ref())?;
@@ -1246,8 +1293,17 @@ pub fn run_game() -> Result<(), JsValue> {
     {
         let gs = game_state.clone();
         let closure = Closure::wrap(Box::new(move |event: MouseEvent| {
-            gs.borrow_mut().end_touch(); // Reset pan state
-            gs.borrow_mut().handle_click(event.offset_x() as f32, event.offset_y() as f32);
+            let mut gs = gs.borrow_mut();
+            let x = event.offset_x() as f32;
+            let y = event.offset_y() as f32;
+            
+            gs.end_touch();
+            
+            if gs.group_select_mode {
+                gs.handle_drag_start(x, y);
+            } else {
+                gs.handle_click(x, y);
+            }
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())?;
         closure.forget();
@@ -1255,7 +1311,9 @@ pub fn run_game() -> Result<(), JsValue> {
     {
         let gs = game_state.clone();
         let closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
-            gs.borrow_mut().end_touch();
+            let mut gs = gs.borrow_mut();
+            gs.handle_drag_end();
+            gs.end_touch();
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())?;
         closure.forget();
@@ -1263,7 +1321,9 @@ pub fn run_game() -> Result<(), JsValue> {
     {
         let gs = game_state.clone();
         let closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
-            gs.borrow_mut().end_touch();
+            let mut gs = gs.borrow_mut();
+            gs.handle_drag_end();
+            gs.end_touch();
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("mouseleave", closure.as_ref().unchecked_ref())?;
         closure.forget();
@@ -1280,8 +1340,35 @@ pub fn run_game() -> Result<(), JsValue> {
     }
     
     // --- TOUCH INPUT (Mobile Zoom & Pan) ---
+    // touchstart
     {
         let gs = game_state.clone();
+        let canvas_clone = canvas.clone();
+        let closure = Closure::wrap(Box::new(move |event: TouchEvent| {
+            let touches = event.touches();
+            if touches.length() == 1 {
+                event.prevent_default();
+                let t = touches.get(0).unwrap();
+                let rect = canvas_clone.get_bounding_client_rect();
+                let x = t.client_x() as f32 - rect.left() as f32;
+                let y = t.client_y() as f32 - rect.top() as f32;
+                
+                let mut gs = gs.borrow_mut();
+                if gs.group_select_mode {
+                    gs.handle_drag_start(x, y);
+                }
+                // Store for later tap detection
+                gs.last_pan_x = Some(x);
+                gs.last_pan_y = Some(y);
+            }
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("touchstart", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+    // touchmove
+    {
+        let gs = game_state.clone();
+        let canvas_clone = canvas.clone();
         let closure = Closure::wrap(Box::new(move |event: TouchEvent| {
             let touches = event.touches();
             if touches.length() == 2 {
@@ -1298,19 +1385,51 @@ pub fn run_game() -> Result<(), JsValue> {
                 
                 gs.borrow_mut().handle_touch_zoom(dist, cx, cy);
             } else if touches.length() == 1 {
-                // Pan
                 event.prevent_default();
                 let t = touches.get(0).unwrap();
-                gs.borrow_mut().handle_pan(t.client_x() as f32, t.client_y() as f32);
+                let rect = canvas_clone.get_bounding_client_rect();
+                let x = t.client_x() as f32 - rect.left() as f32;
+                let y = t.client_y() as f32 - rect.top() as f32;
+                
+                let mut gs = gs.borrow_mut();
+                if gs.group_select_mode && gs.drag_start.is_some() {
+                    gs.handle_drag_move(x, y);
+                } else {
+                    gs.handle_pan(x, y);
+                }
             }
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("touchmove", closure.as_ref().unchecked_ref())?;
         closure.forget();
     }
+    // touchend
     {
         let gs = game_state.clone();
-        let closure = Closure::wrap(Box::new(move |_event: TouchEvent| {
-             gs.borrow_mut().end_touch();
+        let canvas_clone = canvas.clone();
+        let closure = Closure::wrap(Box::new(move |event: TouchEvent| {
+            let mut gs = gs.borrow_mut();
+            
+            // Check if this was a tap (minimal movement)
+            if let (Some(start_x), Some(start_y)) = (gs.last_pan_x, gs.last_pan_y) {
+                let changed = event.changed_touches();
+                if changed.length() == 1 {
+                    let t = changed.get(0).unwrap();
+                    let rect = canvas_clone.get_bounding_client_rect();
+                    let x = t.client_x() as f32 - rect.left() as f32;
+                    let y = t.client_y() as f32 - rect.top() as f32;
+                    
+                    let move_dist = ((x - start_x).powi(2) + (y - start_y).powi(2)).sqrt();
+                    
+                    if gs.group_select_mode && gs.drag_start.is_some() {
+                        gs.handle_drag_end();
+                    } else if move_dist < 15.0 {
+                        // This was a tap, treat as click
+                        gs.handle_click(start_x, start_y);
+                    }
+                }
+            }
+            
+            gs.end_touch();
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("touchend", closure.as_ref().unchecked_ref())?;
         closure.forget();
@@ -1488,55 +1607,84 @@ pub fn run_game() -> Result<(), JsValue> {
              // buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, 255, 0, 0);
         }
         
+        // --- DRAG SELECTION BOX ---
+        if let (Some(start), Some(end)) = (gs.drag_start, gs.drag_current) {
+            let x1 = start.0.min(end.0) as i32;
+            let y1 = start.1.min(end.1) as i32;
+            let x2 = start.0.max(end.0) as i32;
+            let y2 = start.1.max(end.1) as i32;
+            buffer.rect_outline(x1, y1, x2 - x1, y2 - y1, 0, 255, 0);
+        }
+
         // --- UI OVERLAY (Footer) ---
-        let footer_height = 100.0;
-        // Draw Footer BG
+        let footer_height = 60.0; // Reduced from 100
         buffer.rect(0, (HEIGHT as f32 - footer_height) as i32, WIDTH as i32, footer_height as i32, 40, 40, 40);
         
-        // Home Button (Center) - ALWAYS VISIBLE
-        let home_btn_size = 60.0;
-        let home_btn_x = (WIDTH as f32 - home_btn_size) / 2.0;
-        let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - home_btn_size) / 2.0;
+        let btn_size = 40.0;
+        let home_btn_x = (WIDTH as f32 - btn_size) / 2.0;
+        let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - btn_size) / 2.0;
         
-        // Darker Blue
-        buffer.rect(home_btn_x as i32, home_btn_y as i32, home_btn_size as i32, home_btn_size as i32, 0, 0, 150);
-        // White Inner Square (Home Icon style)
-        buffer.rect((home_btn_x + 20.0) as i32, (home_btn_y + 20.0) as i32, 20, 20, 255, 255, 255);
+        // Home Button (Center) - Dark Blue with white inner
+        buffer.rect(home_btn_x as i32, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
+        buffer.rect((home_btn_x + 13.0) as i32, (home_btn_y + 13.0) as i32, 14, 14, 255, 255, 255);
+        
+        // Group Select Button (Right of Home) - Dashed box icon
+        let group_btn_x = home_btn_x + btn_size + 10.0;
+        let group_btn_y = home_btn_y;
+        let group_color = if gs.group_select_mode { (0, 200, 0) } else { (80, 80, 80) };
+        buffer.rect(group_btn_x as i32, group_btn_y as i32, btn_size as i32, btn_size as i32, group_color.0, group_color.1, group_color.2);
+        // Dashed box icon inside
+        buffer.rect_outline((group_btn_x + 8.0) as i32, (group_btn_y + 8.0) as i32, 24, 24, 255, 255, 255);
+        // Inner dashes to make it look like selection
+        buffer.rect((group_btn_x + 10.0) as i32, (group_btn_y + 10.0) as i32, 6, 2, 255, 255, 255);
+        buffer.rect((group_btn_x + 24.0) as i32, (group_btn_y + 10.0) as i32, 6, 2, 255, 255, 255);
 
-        // Draw Selected Building UI (Spawn Button on LEFT)
+        // Action Button (Left) - Context-dependent
         if let Some(b_idx) = gs.selected_building {
-             // Check if it's MY building and it's a Town Center (kind 0)
              if b_idx < gs.buildings.len() && Some(gs.buildings[b_idx].owner_id) == gs.my_id && gs.buildings[b_idx].kind == 0 {
-                 let spawn_btn_size = 60.0;
-                 let spawn_btn_x = 20.0; // Left aligned with padding
-                 let spawn_btn_y = HEIGHT as f32 - footer_height + (footer_height - spawn_btn_size) / 2.0;
-                 
-                 // Blue Button
-                 buffer.rect(spawn_btn_x as i32, spawn_btn_y as i32, spawn_btn_size as i32, spawn_btn_size as i32, 0, 0, 150);
-                 
-                 // Green Plus Overlay
-                 buffer.rect((spawn_btn_x + 10.0) as i32, (spawn_btn_y + 25.0) as i32, 40, 10, 0, 255, 0);
-                 buffer.rect((spawn_btn_x + 25.0) as i32, (spawn_btn_y + 10.0) as i32, 10, 40, 0, 255, 0);
+                 // Spawn Worker Button
+                 buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
+                 // Plus icon
+                 buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, 0, 255, 0);
+                 buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, 0, 255, 0);
              }
-        }
-        
-        // Draw Selected UNIT UI (Build Wall Button on LEFT)
-        // Only if NO building is selected (prioritize building UI if logic overlaps, but they shouldn't)
-        if gs.selected_building.is_none() {
+        } else {
             let any_unit_selected = gs.units.iter().any(|u| u.selected && Some(u.owner_id) == gs.my_id);
             if any_unit_selected {
-                 let build_btn_size = 60.0;
-                 let build_btn_x = 20.0;
-                 let build_btn_y = HEIGHT as f32 - footer_height + (footer_height - build_btn_size) / 2.0;
-                 
-                 // Blue Button
-                 buffer.rect(build_btn_x as i32, build_btn_y as i32, build_btn_size as i32, build_btn_size as i32, 0, 0, 150);
-                 
-                 // "Wall" Icon (Gray Square + Green Plus?) 
-                 // User said: "GIVE THEM A + SIGN BUTTON AS WELL... FOR A waller"
-                 // Let's use the Green Plus for now as requested.
-                 buffer.rect((build_btn_x + 10.0) as i32, (build_btn_y + 25.0) as i32, 40, 10, 0, 255, 0);
-                 buffer.rect((build_btn_x + 25.0) as i32, (build_btn_y + 10.0) as i32, 10, 40, 0, 255, 0);
+                 // Build Wall Button
+                 buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
+                 // Wall icon (small brick pattern)
+                 buffer.rect(15, (home_btn_y + 10.0) as i32, 12, 8, 150, 150, 150);
+                 buffer.rect(29, (home_btn_y + 10.0) as i32, 12, 8, 130, 130, 130);
+                 buffer.rect(15, (home_btn_y + 20.0) as i32, 12, 8, 130, 130, 130);
+                 buffer.rect(29, (home_btn_y + 20.0) as i32, 12, 8, 150, 150, 150);
+            }
+        }
+        
+        // --- SELECTED UNITS DISPLAY (Above footer, left side) ---
+        let selected_units: Vec<_> = gs.units.iter().filter(|u| u.selected && Some(u.owner_id) == gs.my_id).collect();
+        if !selected_units.is_empty() {
+            let unit_icon_size = 20.0;
+            let icons_y = HEIGHT as f32 - footer_height - unit_icon_size - 5.0;
+            let max_display = 10; // Max icons to show
+            
+            for (i, u) in selected_units.iter().take(max_display).enumerate() {
+                let icon_x = 10.0 + (i as f32 * (unit_icon_size + 4.0));
+                // Draw unit color square
+                buffer.rect(icon_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, u.color.0, u.color.1, u.color.2);
+                // Border
+                buffer.rect_outline(icon_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, 255, 255, 255);
+            }
+            
+            // If more than max, show "+N"
+            if selected_units.len() > max_display {
+                let extra = selected_units.len() - max_display;
+                let text_x = 10.0 + (max_display as f32 * (unit_icon_size + 4.0));
+                // Simple "+N" indicator (just a small box with different color)
+                buffer.rect(text_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, 100, 100, 100);
+                // Plus sign to indicate "more"
+                buffer.rect((text_x + 7.0) as i32, (icons_y + 9.0) as i32, 6, 2, 255, 255, 255);
+                buffer.rect((text_x + 9.0) as i32, (icons_y + 7.0) as i32, 2, 6, 255, 255, 255);
             }
         }
         
@@ -1549,8 +1697,6 @@ pub fn run_game() -> Result<(), JsValue> {
                 let sx = (bx - cam_x) * zoom + screen_center_x;
                 let sy = (by - cam_y) * zoom + screen_center_y;
                 let size = tile_size * 1.5;
-                
-                // Green Selection Box
                 let box_size = size * 1.2;
                 buffer.rect_outline((sx - box_size/2.0) as i32, (sy - box_size/2.0) as i32, box_size as i32, box_size as i32, 0, 255, 0);
             }

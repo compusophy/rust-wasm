@@ -159,7 +159,7 @@
         async function start() {
             try {
                 // Cache busting to ensure we load the new WASM version
-                await init('./pkg/temty_bg.wasm?v=19');
+                await init('./pkg/temty_bg.wasm?v=20');
             } catch(e) {
                 console.error("WASM init failed:", e);
                 statusEl.className = 'status-error';
