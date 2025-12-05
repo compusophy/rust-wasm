@@ -1299,7 +1299,11 @@ pub fn run_game() -> Result<(), JsValue> {
             
             gs.end_touch();
             
-            if gs.group_select_mode {
+            // Always allow footer clicks (for button toggles)
+            let footer_height = 60.0;
+            if y > HEIGHT as f32 - footer_height {
+                gs.handle_click(x, y);
+            } else if gs.group_select_mode {
                 gs.handle_drag_start(x, y);
             } else {
                 gs.handle_click(x, y);
@@ -1354,7 +1358,9 @@ pub fn run_game() -> Result<(), JsValue> {
                 let y = t.client_y() as f32 - rect.top() as f32;
                 
                 let mut gs = gs.borrow_mut();
-                if gs.group_select_mode {
+                // Only start drag if not in footer (footer needs button clicks)
+                let footer_height = 60.0;
+                if gs.group_select_mode && y <= HEIGHT as f32 - footer_height {
                     gs.handle_drag_start(x, y);
                 }
                 // Store for later tap detection
@@ -1628,16 +1634,13 @@ pub fn run_game() -> Result<(), JsValue> {
         buffer.rect(home_btn_x as i32, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
         buffer.rect((home_btn_x + 13.0) as i32, (home_btn_y + 13.0) as i32, 14, 14, 255, 255, 255);
         
-        // Group Select Button (Right of Home) - Dashed box icon
+        // Group Select Button (Right of Home) - Simple box outline icon
         let group_btn_x = home_btn_x + btn_size + 10.0;
         let group_btn_y = home_btn_y;
         let group_color = if gs.group_select_mode { (0, 200, 0) } else { (80, 80, 80) };
         buffer.rect(group_btn_x as i32, group_btn_y as i32, btn_size as i32, btn_size as i32, group_color.0, group_color.1, group_color.2);
-        // Dashed box icon inside
+        // Clean selection box icon
         buffer.rect_outline((group_btn_x + 8.0) as i32, (group_btn_y + 8.0) as i32, 24, 24, 255, 255, 255);
-        // Inner dashes to make it look like selection
-        buffer.rect((group_btn_x + 10.0) as i32, (group_btn_y + 10.0) as i32, 6, 2, 255, 255, 255);
-        buffer.rect((group_btn_x + 24.0) as i32, (group_btn_y + 10.0) as i32, 6, 2, 255, 255, 255);
 
         // Action Button (Left) - Context-dependent
         if let Some(b_idx) = gs.selected_building {
