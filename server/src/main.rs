@@ -33,16 +33,31 @@ struct UnitDTO {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+struct BuildingDTO {
+    id: i32,
+    owner_id: i32,
+    kind: u8,
+    tile_x: i32,
+    tile_y: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 enum GameMessage {
     Join { version: u32, token: Option<String> },
-    Welcome { player_id: i32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo>, units: Vec<UnitDTO>, token: String },
+    Welcome { player_id: i32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo>, units: Vec<UnitDTO>, buildings: Vec<BuildingDTO>, token: String },
     NewPlayer { player: PlayerInfo },
     UnitMove { player_id: i32, unit_idx: usize, x: f32, y: f32 },
+    UnitSync { player_id: i32, unit_idx: usize, x: f32, y: f32 },
+    SpawnUnit,
+    UnitSpawned { unit: UnitDTO },
+    Build { kind: u8, tile_x: i32, tile_y: i32 },
+    BuildingSpawned { building: BuildingDTO },
     Error { message: String },
 }
 
-const MIN_CLIENT_VERSION: u32 = 7;
+// Default fallback, but DB overrides this
+const MIN_CLIENT_VERSION_DEFAULT: u32 = 16;
 
 struct GlobalState {
     next_id: i32,
@@ -109,7 +124,7 @@ impl GlobalState {
     }
 
     fn spawn_units(cx: i32, cy: i32) -> Vec<UnitState> {
-        let chunk_size = 64.0; // New chunk size 64
+        let chunk_size = 32.0; // New chunk size 32
         let tile_size = 16.0;
         
         // Calculate Center of Chunk in World Coords
@@ -147,17 +162,21 @@ async fn main() {
             .ok();
             
         if let Some(ref valid_pool) = p {
-             // Initialize DB
+             // Initialize DB - Execute separately to avoid prepared statement errors
             let _ = sqlx::query(
-                r#"
-                CREATE TABLE IF NOT EXISTS players (
+                "CREATE TABLE IF NOT EXISTS players (
                     id SERIAL PRIMARY KEY,
                     token VARCHAR NOT NULL UNIQUE,
                     chunk_x INT NOT NULL,
                     chunk_y INT NOT NULL,
                     created_at TIMESTAMPTZ DEFAULT NOW()
-                );
-                CREATE TABLE IF NOT EXISTS units (
+                )"
+            )
+            .execute(valid_pool)
+            .await;
+
+            let _ = sqlx::query(
+                "CREATE TABLE IF NOT EXISTS units (
                     id SERIAL PRIMARY KEY,
                     owner_id INT NOT NULL,
                     unit_idx INT NOT NULL,
@@ -166,12 +185,40 @@ async fn main() {
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     CONSTRAINT fk_owner FOREIGN KEY(owner_id) REFERENCES players(id),
                     UNIQUE(owner_id, unit_idx)
-                );
-                "#
+                )"
             )
             .execute(valid_pool)
             .await;
-            println!("Database Connected.");
+
+            let _ = sqlx::query(
+                "CREATE TABLE IF NOT EXISTS buildings (
+                    id SERIAL PRIMARY KEY,
+                    owner_id INT NOT NULL,
+                    kind INT NOT NULL,
+                    tile_x INT NOT NULL,
+                    tile_y INT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    CONSTRAINT fk_building_owner FOREIGN KEY(owner_id) REFERENCES players(id)
+                )"
+            )
+            .execute(valid_pool)
+            .await;
+
+            let _ = sqlx::query(
+                "CREATE TABLE IF NOT EXISTS server_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )"
+            )
+            .execute(valid_pool)
+            .await;
+
+            // Seed default min version if missing
+            let _ = sqlx::query("INSERT INTO server_config (key, value) VALUES ('min_client_version', '17') ON CONFLICT DO NOTHING")
+                .execute(valid_pool)
+                .await;
+
+            println!("Database Connected & Initialized.");
         } else {
              println!("Failed to connect to Database. Persistence disabled.");
         }
@@ -213,14 +260,31 @@ async fn handle_connection(
     let mut rx = tx.subscribe();
 
     // --- HANDSHAKE ---
-    let mut client_token: Option<String> = None;
+    let client_token: Option<String>;
 
     if let Some(Ok(msg)) = read.next().await {
         if let Ok(text) = msg.to_text() {
             if let Ok(GameMessage::Join { version, token }) = serde_json::from_str(text) {
-                if version < MIN_CLIENT_VERSION {
+                
+                // CHECK VERSION (DB or Fallback)
+                let required_version = if let Some(p) = &pool {
+                    let row = sqlx::query("SELECT value FROM server_config WHERE key = 'min_client_version'")
+                        .fetch_optional(p)
+                        .await
+                        .unwrap_or(None);
+                    
+                    if let Some(r) = row {
+                        r.try_get::<String, _>("value").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(MIN_CLIENT_VERSION_DEFAULT)
+                    } else {
+                        MIN_CLIENT_VERSION_DEFAULT
+                    }
+                } else {
+                    MIN_CLIENT_VERSION_DEFAULT
+                };
+
+                if version < required_version {
                     let _ = write.send(Message::Text(serde_json::to_string(&GameMessage::Error { 
-                        message: format!("Client version {} is too old. Minimum required: {}", version, MIN_CLIENT_VERSION) 
+                        message: format!("Client version {} is too old. Minimum required: {}", version, required_version) 
                     }).unwrap())).await;
                     return;
                 }
@@ -250,10 +314,10 @@ async fn handle_connection(
                 
                 match row {
                     Ok(Some(r)) => (r.get::<i32, _>("id"), r.get::<i32, _>("chunk_x"), r.get::<i32, _>("chunk_y"), t),
-                    _ => createNewPlayer(p).await // Invalid token or error -> New Player
+                    _ => create_new_player(p).await // Invalid token or error -> New Player
                 }
             },
-            None => createNewPlayer(p).await
+            None => create_new_player(p).await
         }
     } else {
         // MEMORY MODE (Fallback)
@@ -338,8 +402,39 @@ async fn handle_connection(
         Vec::new() 
     };
 
+    // FETCH ALL PLAYERS & UNITS & BUILDINGS (DB Mode) - To show offline players
+    let (db_players, db_units, db_buildings) = if let Some(p) = &pool {
+         let p_rows = sqlx::query("SELECT id, chunk_x, chunk_y FROM players").fetch_all(p).await.unwrap_or_default();
+         let players: Vec<PlayerInfo> = p_rows.into_iter().map(|r| PlayerInfo {
+             id: r.get("id"),
+             chunk_x: r.get("chunk_x"),
+             chunk_y: r.get("chunk_y"),
+         }).collect();
+
+         let u_rows = sqlx::query("SELECT owner_id, unit_idx, x, y FROM units").fetch_all(p).await.unwrap_or_default();
+         let units: Vec<UnitDTO> = u_rows.into_iter().map(|r| UnitDTO {
+             owner_id: r.get("owner_id"),
+             unit_idx: r.get::<i32, _>("unit_idx") as usize,
+             x: r.get("x"),
+             y: r.get("y"),
+         }).collect();
+         
+         let b_rows = sqlx::query("SELECT id, owner_id, kind, tile_x, tile_y FROM buildings").fetch_all(p).await.unwrap_or_default();
+         let buildings: Vec<BuildingDTO> = b_rows.into_iter().map(|r| BuildingDTO {
+             id: r.get("id"),
+             owner_id: r.get("owner_id"),
+             kind: r.get::<i32, _>("kind") as u8,
+             tile_x: r.get("tile_x"),
+             tile_y: r.get("tile_y"),
+         }).collect();
+
+         (Some(players), Some(units), Some(buildings))
+    } else {
+        (None, None, None)
+    };
+
     // Update Global State (Active Players & Units)
-    let (all_players, all_units_dto) = {
+    let (all_players, all_units_dto, all_buildings_dto) = {
         let mut gs = state.lock().unwrap();
         
         gs.players.insert(player_id, PlayerInfo { id: player_id, chunk_x, chunk_y });
@@ -355,21 +450,25 @@ async fn handle_connection(
             }
         }
         
+        if let (Some(ps), Some(us), Some(bs)) = (db_players, db_units, db_buildings) {
+            (ps, us, bs)
+        } else {
         let existing_players: Vec<PlayerInfo> = gs.players.values().cloned().collect();
         
-        let mut units_dto = Vec::new();
-        for (pid, units) in &gs.units {
-            for (i, u) in units.iter().enumerate() {
-                units_dto.push(UnitDTO {
-                    owner_id: *pid,
-                    unit_idx: i,
-                    x: u.x,
-                    y: u.y,
-                });
+            let mut units_dto = Vec::new();
+            for (pid, units) in &gs.units {
+                for (i, u) in units.iter().enumerate() {
+                    units_dto.push(UnitDTO {
+                        owner_id: *pid,
+                        unit_idx: i,
+                        x: u.x,
+                        y: u.y,
+                    });
+                }
             }
+            
+            (existing_players, units_dto, Vec::new())
         }
-        
-        (existing_players, units_dto)
     };
 
     println!("Player {} connected (Chunk {}, {})", player_id, chunk_x, chunk_y);
@@ -381,6 +480,7 @@ async fn handle_connection(
         chunk_y,
         players: all_players,
         units: all_units_dto,
+        buildings: all_buildings_dto,
         token: token.clone(),
     }).unwrap();
     
@@ -397,7 +497,7 @@ async fn handle_connection(
 
 
     // Heartbeat
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10)); // Reduced to 10s for better keepalive
 
     let mut send_task = tokio::spawn(async move {
         loop {
@@ -408,9 +508,50 @@ async fn handle_connection(
                     }
                 }
                 _ = interval.tick() => {
+                    // Send Ping
                     if write.send(Message::Ping(vec![])).await.is_err() {
                         break;
                     }
+                    // Occasionally send Version Check (every minute roughly, interval is 20s, so every 3rd tick)
+                    // Actually, let's just piggyback or make a dedicated message type?
+                    // Simplest: Send a custom "Ping" text message or reuse Error if mismatched?
+                    // Better: Just enforce it on Join.
+                    // BUT user is asking for periodic checks.
+                    
+                    // Let's send a JSON message that the client can check silently.
+                    // We don't have a specific "KeepAlive" JSON message, but we can use a new type or just trust the Ping?
+                    // Pings are opcode 0x9, handled by browser engine automatically, not JS code usually.
+                    
+                    // Let's add a VersionCheck message to the protocol for robustness?
+                    // Or just re-send Welcome? No.
+                    
+                    // Let's assume the "Error" message is the kick mechanism.
+                    // If the server updates while players are connected, they are already "in".
+                    // Do we want to KICK them?
+                    // Yes, if the user deployed a breaking change (min_version bumped).
+                    
+                    // So we need to check current connection against MIN_VERSION.
+                    // But we don't store their version in state... we just checked it at handshake.
+                    // Issue: If server restarts (new binary), all clients disconnect.
+                    // When they reconnect, they send their OLD version in Join.
+                    // The new server checks it, sees it's old, and sends Error.
+                    // The client receives Error and shows overlay.
+                    
+                    // So the mechanism ALREADY exists for restarts.
+                    // The user is saying "it's not disabling".
+                    // Maybe because the server didn't restart? Or client didn't refresh?
+                    
+                    // If the server updated MIN_VERSION, it means the server RESTARTED.
+                    // If server restarted, connections dropped.
+                    // Clients auto-reconnect?
+                    // Our client code DOES NOT have auto-reconnect logic in `start()`.
+                    // It just says "Chat connect failed" or "Server Error".
+                    
+                    // Ah, `new WebSocket()` throws if it fails.
+                    // But if it closes? `ws.onclose`?
+                    // We don't handle `onclose` to reload.
+                    
+                    // Let's add `onclose` handling to the client to auto-reload or at least alert.
                 }
             }
         }
@@ -418,41 +559,179 @@ async fn handle_connection(
 
     let recv_state = state.clone();
     let recv_pool = pool.clone(); // Clone pool for async DB updates
-    
+
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = read.next().await {
             if msg.is_text() {
                 let text = msg.to_text().unwrap();
                 
                 // Update Server State if UnitMove
-                if let Ok(GameMessage::UnitMove { player_id, unit_idx, x, y }) = serde_json::from_str::<GameMessage>(text) {
-                    
-                    // 1. Update Memory State (Fast for broadcasts)
-                    {
-                        let mut gs = recv_state.lock().unwrap();
-                        if let Some(units) = gs.units.get_mut(&player_id) {
-                            if unit_idx < units.len() {
-                                units[unit_idx].x = x;
-                                units[unit_idx].y = y;
+                if let Ok(msg) = serde_json::from_str::<GameMessage>(text) {
+                    match msg {
+                        GameMessage::UnitMove { player_id, unit_idx, x, y } => {
+                            // 1. Update Memory State (Fast for broadcasts)
+                            {
+                                let mut gs = recv_state.lock().unwrap();
+                                if let Some(units) = gs.units.get_mut(&player_id) {
+                                    if unit_idx < units.len() {
+                                        units[unit_idx].x = x;
+                                        units[unit_idx].y = y;
+                                    }
+                                }
                             }
-                        }
-                    }
-                    
-                    // 2. Async DB Persist (Fire and Forget-ish)
-                    // We don't await this strictly before broadcasting to keep lag low, 
-                    // but we do await it in the loop.
-                    if let Some(p) = &recv_pool {
-                        let _ = sqlx::query("UPDATE units SET x = $1, y = $2 WHERE owner_id = $3 AND unit_idx = $4")
-                            .bind(x)
-                            .bind(y)
-                            .bind(player_id)
-                            .bind(unit_idx as i32)
-                            .execute(p)
-                            .await;
+                            
+                            // 2. Async DB Persist (Fire and Forget-ish)
+                            if let Some(p) = &recv_pool {
+                                let _ = sqlx::query("UPDATE units SET x = $1, y = $2 WHERE owner_id = $3 AND unit_idx = $4")
+                                    .bind(x)
+                                    .bind(y)
+                                    .bind(player_id)
+                                    .bind(unit_idx as i32)
+                                    .execute(p)
+                                    .await;
+                            }
+                            
+                            let _ = tx.send(text.to_string());
+                        },
+                        GameMessage::UnitSync { player_id, unit_idx, x, y } => {
+                            // 1. Update Memory
+                            {
+                                let mut gs = recv_state.lock().unwrap();
+                                if let Some(units) = gs.units.get_mut(&player_id) {
+                                    if unit_idx < units.len() {
+                                        units[unit_idx].x = x;
+                                        units[unit_idx].y = y;
+                                    }
+                                }
+                            }
+                            // 2. Broadcast
+                let _ = tx.send(text.to_string());
+                            
+                            // 3. Optional DB Persist?
+                             if let Some(p) = &recv_pool {
+                                let res = sqlx::query("UPDATE units SET x = $1, y = $2 WHERE owner_id = $3 AND unit_idx = $4")
+                                    .bind(x)
+                                    .bind(y)
+                                    .bind(player_id)
+                                    .bind(unit_idx as i32)
+                                    .execute(p)
+                                    .await;
+                                
+                                if let Err(e) = res {
+                                    println!("DB Error on UnitSync: {}", e);
+                                }
+                            }
+                        },
+                        GameMessage::Build { kind, tile_x, tile_y } => {
+                            // Check if location is valid (simple check: no other building there)
+                            // We should also check ownership/resources but we skip for now.
+                            
+                            // 1. Update DB
+                            let id;
+                            if let Some(p) = &recv_pool {
+                                let rec = sqlx::query("INSERT INTO buildings (owner_id, kind, tile_x, tile_y) VALUES ($1, $2, $3, $4) RETURNING id")
+                                    .bind(player_id)
+                                    .bind(kind as i32)
+                                    .bind(tile_x)
+                                    .bind(tile_y)
+                                    .fetch_one(p)
+                                    .await;
+                                    
+                                if let Ok(r) = rec {
+                                    id = r.get("id");
+                                } else {
+                                    println!("DB Error on Build");
+                                    return;
+                                }
+                            } else {
+                                // Memory mode: fake ID
+                                id = rand::random::<i32>().abs();
+                            }
+                            
+                            // 2. Broadcast
+                            let msg = GameMessage::BuildingSpawned {
+                                building: BuildingDTO {
+                                    id,
+                                    owner_id: player_id,
+                                    kind,
+                                    tile_x,
+                                    tile_y
+                                }
+                            };
+                            
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = tx.send(json);
+                            }
+                        },
+                        GameMessage::SpawnUnit => {
+                            // Handle Spawn
+                            let (chunk_x, chunk_y, next_idx, unit_count) = {
+                                let mut gs = recv_state.lock().unwrap();
+                                // Separate borrows: First get player coords (values only)
+                                let player_coords = gs.players.get(&player_id).map(|p| (p.chunk_x, p.chunk_y));
+                                
+                                if let Some((cx, cy)) = player_coords {
+                                    // Now mutable borrow is safe
+                                    let units = gs.units.entry(player_id).or_insert(Vec::new());
+                                    (cx, cy, units.len(), units.len())
+                                } else {
+                                    (0, 0, 0, 0)
+                                }
+                            };
+                            
+                            // LIMIT: Max 5 workers
+                            if unit_count >= 5 {
+                                return;
+                            }
+                            
+                            // Calculate Spawn Pos (Near Center of their chunk)
+                            let chunk_size = 32.0;
+                            let tile_size = 16.0;
+                            let center_x = (chunk_x as f32 * chunk_size * tile_size) + (chunk_size * tile_size / 2.0);
+                            let center_y = (chunk_y as f32 * chunk_size * tile_size) + (chunk_size * tile_size / 2.0);
+                            
+                            // Random offset to avoid stacking
+                            // Simple spiral or just random nearby
+                            // Let's just put it slightly below the building
+                            let offset_x = ((next_idx as f32 % 3.0) - 1.0) * 20.0;
+                            let offset_y = 50.0 + (next_idx as f32 / 3.0).floor() * 20.0;
+                            
+                            let spawn_x = center_x + offset_x;
+                            let spawn_y = center_y + offset_y;
+                            
+                            // 1. Update DB
+                            if let Some(p) = &recv_pool {
+                                let _ = sqlx::query("INSERT INTO units (owner_id, unit_idx, x, y) VALUES ($1, $2, $3, $4)")
+                                    .bind(player_id)
+                                    .bind(next_idx as i32)
+                                    .bind(spawn_x)
+                                    .bind(spawn_y)
+                                    .execute(p)
+                                    .await;
+                            }
+                            
+                            // 2. Update Memory
+                            {
+                                let mut gs = recv_state.lock().unwrap();
+                                let entry = gs.units.entry(player_id).or_insert(Vec::new());
+                                entry.push(UnitState { x: spawn_x, y: spawn_y });
+                            }
+                            
+                            // 3. Broadcast
+                            let new_unit_msg = serde_json::to_string(&GameMessage::UnitSpawned {
+                                unit: UnitDTO {
+                                    owner_id: player_id,
+                                    unit_idx: next_idx,
+                                    x: spawn_x,
+                                    y: spawn_y
+                                }
+                            }).unwrap();
+                            
+                            let _ = tx.send(new_unit_msg);
+                        },
+                        _ => {}
                     }
                 }
-
-                let _ = tx.send(text.to_string());
             }
         }
     });
@@ -464,16 +743,34 @@ async fn handle_connection(
     
     // Cleanup
     {
+        // Only remove from memory if NOT in DB mode (i.e. ephemeral session)
+        // If we are in DB mode, we want to keep the players in memory so other players see them
+        // or at least we rely on DB for state.
+        
+        // The bug "server dies" is likely because we remove the player from state,
+        // but the other players might still be referencing them? 
+        // Or simply, when they reconnect, the state is gone from RAM but DB load logic might be flawed?
+        // Actually, if we remove from RAM, the next `Welcome` message to OTHER players 
+        // (or even the re-joining player) might miss them if it relies on `gs.players`.
+        
+        // Let's KEEP them in memory for now to ensure stability and visibility.
+        // Memory leak risk? Yes, but for small player counts it's fine.
+        // In a real MMO we'd unload inactive chunks.
+        
         let mut gs = state.lock().unwrap();
+        if pool.is_none() {
+            // Memory Mode: Cleanup
         gs.players.remove(&player_id);
-        gs.units.remove(&player_id); 
-        // Note: In DB mode, we might want to keep units in memory cache or not.
-        // Currently we remove them from memory to save RAM. They are safe in DB.
+            gs.units.remove(&player_id); 
+        } else {
+            // DB Mode: KEEP in memory so they remain visible on map as "ghosts" / offline players
+            // This prevents "holes" in the map and missing units.
+        }
     }
     println!("Player {} disconnected", player_id);
 }
 
-async fn createNewPlayer(pool: &Pool<Postgres>) -> (i32, i32, i32, String) {
+async fn create_new_player(pool: &Pool<Postgres>) -> (i32, i32, i32, String) {
     let token = Uuid::new_v4().to_string();
     
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM players")

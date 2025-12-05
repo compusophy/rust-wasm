@@ -1,0 +1,17 @@
+{
+  "accountAssociation": {
+    "header": "eyJmaWQiOjM2MjEsInR5cGUiOiJjdXN0b2R5Iiwia2V5IjoiMHgyY2Q4NWEwOTMyNjFmNTkyNzA4MDRBNkVBNjk3Q2VBNENlQkVjYWZFIn0",
+    "payload": "eyJkb21haW4iOiJ0ZW10eS52ZXJjZWwuYXBwIn0",
+    "signature": "MHgwZmJiYWIwODg3YTU2MDFiNDU3MzVkOTQ5MDRjM2Y1NGUxMzVhZTQxOGEzMWQ5ODNhODAzZmZlYWNlZWMyZDYzNWY4ZTFjYWU4M2NhNTAwOTMzM2FmMTc1NDlmMDY2YTVlOWUwNTljNmZiNDUxMzg0Njk1NzBhODNiNjcyZWJjZTFi"
+  },
+  "miniapp": {
+    "version": "1",
+    "name": "Temty",
+    "iconUrl": "https://temty.vercel.app/logo.png",
+    "homeUrl": "https://temty.vercel.app/",
+    "imageUrl": "https://temty.vercel.app/logo.png",
+    "buttonTitle": "Play Temty",
+    "splashImageUrl": "https://temty.vercel.app/logo.png",
+    "splashBackgroundColor": "#222222"
+  }
+}

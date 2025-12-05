@@ -34,16 +34,30 @@ struct UnitDTO {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+struct BuildingDTO {
+    id: i32,
+    owner_id: i32,
+    kind: u8,
+    tile_x: i32,
+    tile_y: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 enum GameMessage {
     Join { version: u32, token: Option<String> },
-    Welcome { player_id: i32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo>, units: Vec<UnitDTO>, token: String },
+    Welcome { player_id: i32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo>, units: Vec<UnitDTO>, buildings: Vec<BuildingDTO>, token: String },
     NewPlayer { player: PlayerInfo },
     UnitMove { player_id: i32, unit_idx: usize, x: f32, y: f32 },
+    UnitSync { player_id: i32, unit_idx: usize, x: f32, y: f32 },
+    SpawnUnit, 
+    UnitSpawned { unit: UnitDTO },
+    Build { kind: u8, tile_x: i32, tile_y: i32 },
+    BuildingSpawned { building: BuildingDTO },
     Error { message: String },
 }
 
-const CLIENT_VERSION: u32 = 7;
+const CLIENT_VERSION: u32 = 19;
 
 // --- CHAT CLIENT ---
 #[wasm_bindgen]
@@ -69,7 +83,7 @@ impl ChatClient {
 // --- PIXEL BUFFER ENGINE ---
 const WIDTH: u32 = 360;
 const HEIGHT: u32 = 640;
-const CHUNK_SIZE: i32 = 64; // User requested 64x64 plot per player
+const CHUNK_SIZE: i32 = 32; // User requested 32x32 plot per player
 const TILE_SIZE_BASE: f32 = 16.0;
 
 struct PixelBuffer {
@@ -227,6 +241,15 @@ struct GameState {
     last_touch_dist: Option<f32>,
     last_pan_x: Option<f32>,
     last_pan_y: Option<f32>,
+    
+    // Selection
+    selected_building: Option<usize>,
+    
+    // Sync
+    last_sync_time: f64,
+    
+    // Smooth Zoom
+    target_zoom: f32,
 }
 
 impl GameState {
@@ -246,6 +269,9 @@ impl GameState {
             last_touch_dist: None,
             last_pan_x: None,
             last_pan_y: None,
+            selected_building: None,
+            last_sync_time: 0.0,
+            target_zoom: 1.0,
         };
 
         // Generate Initial Chunk (0,0)
@@ -281,6 +307,22 @@ impl GameState {
         });
     }
 
+    fn calculate_tile_type(cx: i32, cy: i32, lx: i32, ly: i32) -> TileType {
+        // Ensure walkability for Town Center (center of chunk)
+        let mid = CHUNK_SIZE / 2;
+        if lx >= mid - 3 && lx <= mid + 3 && ly >= mid - 3 && ly <= mid + 3 {
+            return TileType::Grass;
+        }
+
+        let seed = ((cx as i64 * 73856093) ^ (cy as i64 * 19349663) ^ (lx as i64 * 83492791) ^ (ly as i64 * 23492871)) as f64;
+        let r = (seed.sin() * 10000.0).fract().abs();
+        
+        if r < 0.25 { TileType::Forest }
+        else if r < 0.28 { TileType::Mountain }
+        else if r < 0.283 { TileType::Gold }
+        else { TileType::Grass }
+    }
+
     fn generate_chunk(&mut self, cx: i32, cy: i32) {
         if self.chunks.contains_key(&(cx, cy)) { return; }
         
@@ -288,31 +330,9 @@ impl GameState {
         for y in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 let idx = (y * CHUNK_SIZE + x) as usize;
-                // Pseudo-random seed based on coordinates for consistency
-                let seed = ((cx as i64 * 73856093) ^ (cy as i64 * 19349663) ^ (x as i64 * 83492791) ^ (y as i64 * 23492871)) as f64;
-                let r = (seed.sin() * 10000.0).fract().abs();
-                
-                // Reduced water frequency from 0.1 to 0.03
-                if r < 0.03 { tiles[idx] = TileType::Water; }
-                else if r < 0.25 { tiles[idx] = TileType::Forest; }
-                else if r < 0.28 { tiles[idx] = TileType::Mountain; }
-                else if r < 0.30 { tiles[idx] = TileType::Gold; }
+                tiles[idx] = GameState::calculate_tile_type(cx, cy, x, y);
             }
         }
-        
-        // Ensure walkability for Town Center (simplified: clear center of ANY chunk where a player spawns)
-        // Center is at CHUNK_SIZE / 2
-        let mid = CHUNK_SIZE / 2;
-        
-        // Clear a 5x5 area in the center for Building + Units
-        for y in (mid-3)..(mid+4) {
-            for x in (mid-3)..(mid+4) {
-                if x >= 0 && x < CHUNK_SIZE && y >= 0 && y < CHUNK_SIZE {
-                    tiles[(y * CHUNK_SIZE + x) as usize] = TileType::Grass;
-                }
-            }
-        }
-
         self.chunks.insert((cx, cy), Chunk { tiles });
     }
 
@@ -328,17 +348,26 @@ impl GameState {
         if let Some(chunk) = self.chunks.get(&(cx, cy)) {
             Some(chunk.tiles[(ly * CHUNK_SIZE + lx) as usize])
         } else {
-            None
+            // Virtual terrain for pathfinding (Fog of War)
+            Some(GameState::calculate_tile_type(cx, cy, lx, ly))
         }
     }
 
     fn is_tile_walkable(&self, gx: i32, gy: i32) -> bool {
+        let cx = (gx as f32 / CHUNK_SIZE as f32).floor() as i32;
+        let cy = (gy as f32 / CHUNK_SIZE as f32).floor() as i32;
+        
+        // STRICT CHECK: If chunk doesn't exist, it's void/black => NOT walkable
+        if !self.chunks.contains_key(&(cx, cy)) {
+            return false;
+        }
+
         match self.get_tile_type(gx, gy) {
             Some(t) => match t {
                 TileType::Water | TileType::Forest | TileType::Mountain | TileType::Gold => return false,
                 _ => {}
             },
-            None => return false, // Cannot walk in void
+            None => return false, // Should be covered by chunk check above
         }
         
         // Check Buildings
@@ -350,17 +379,22 @@ impl GameState {
         true
     }
 
-    fn find_path(&self, start: (f32, f32), end: (f32, f32)) -> Vec<(f32, f32)> {
+    fn find_path(&mut self, start: (f32, f32), end: (f32, f32)) -> Vec<(f32, f32)> {
         let start_tx = (start.0 / TILE_SIZE_BASE).floor() as i32;
         let start_ty = (start.1 / TILE_SIZE_BASE).floor() as i32;
         let end_tx = (end.0 / TILE_SIZE_BASE).floor() as i32;
         let end_ty = (end.1 / TILE_SIZE_BASE).floor() as i32;
 
         if start_tx == end_tx && start_ty == end_ty { return vec![end]; }
+        
+        // Removed aggressive chunk generation for Fog of War
+        // The pathfinder now uses get_tile_type which calculates virtual terrain
+        
         if !self.is_tile_walkable(end_tx, end_ty) { return vec![]; }
 
-        // Limit pathfinding search space for performance (e.g., 50 tile radius)
-        if (start_tx - end_tx).abs() > 100 || (start_ty - end_ty).abs() > 100 { return vec![]; }
+        // Limit pathfinding search space for performance
+        // Increased from 100 to 5000 to allow cross-map movement
+        if (start_tx - end_tx).abs() > 5000 || (start_ty - end_ty).abs() > 5000 { return vec![]; }
 
         let mut frontier = BinaryHeap::new();
         frontier.push(Node { cost: 0, pos: (start_tx, start_ty) });
@@ -376,7 +410,8 @@ impl GameState {
 
         while let Some(Node { cost: _, pos: current }) = frontier.pop() {
             steps += 1;
-            if steps > 2000 { break; } // Safety break
+            // Increased safety break from 2000 to 15000 to allow long paths
+            if steps > 15000 { break; } 
 
             if current == (end_tx, end_ty) {
                 found = true;
@@ -390,6 +425,8 @@ impl GameState {
 
             for (dx, dy) in dirs.iter() {
                 let next = (current.0 + dx, current.1 + dy);
+                
+                // Removed chunk generation here too
 
                 if self.is_tile_walkable(next.0, next.1) {
                     // Prevent corner cutting
@@ -427,15 +464,76 @@ impl GameState {
         path
     }
 
-    fn update(&mut self) {
-        let speed = 0.3;
+    fn update(&mut self, dt: f64) {
+        // Speed in pixels per SECOND (assuming tile base 16.0)
+        // Previously 0.3 per frame @ 60fps = 18.0 per sec?
+        // Let's make it consistent. 0.3 * 60 = 18.0. Let's try 50.0 for a good walking speed.
+        let speed = (60.0 * dt) as f32; 
         let separation_radius = 10.0;
-        let separation_force = 0.06;
+        let separation_force = 0.06; // This might need scaling with DT too
+
+        // Smooth Zoom
+        if (self.target_zoom - self.zoom).abs() > 0.001 {
+            self.zoom += (self.target_zoom - self.zoom) * 10.0 * dt as f32;
+        } else {
+            self.zoom = self.target_zoom;
+        }
 
         let unit_positions: Vec<(f32, f32)> = self.units.iter().map(|u| (u.x, u.y)).collect();
         let mut updates: Vec<(usize, f32, f32, bool)> = Vec::new();
 
+        let my_id = self.my_id;
+
+        // --- FOG OF WAR REVEAL ---
+        // Perform chunk generation *before* the loop to avoid borrow checker issues
+        // Collect all chunks that need generation from my units
+        let mut chunks_to_generate = Vec::new();
+        if let Some(my_id) = self.my_id {
+            for u in &self.units {
+                if u.owner_id == my_id {
+                    let cx = (u.x / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+                    let cy = (u.y / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+                    
+                    // Reveal 3x3 area
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            if !self.chunks.contains_key(&(cx+dx, cy+dy)) {
+                                chunks_to_generate.push((cx+dx, cy+dy));
+                            }
+                        }
+                    }
+                    
+                    // Also check target path destination if moving (anticipate arrival)
+                    if let Some(target) = u.path.last() {
+                        let tcx = (target.0 / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+                        let tcy = (target.1 / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+                        if !self.chunks.contains_key(&(tcx, tcy)) {
+                            chunks_to_generate.push((tcx, tcy));
+                        }
+                    }
+                }
+            }
+        }
+        
+        for (cx, cy) in chunks_to_generate {
+            self.generate_chunk(cx, cy);
+        }
+
         for (i, unit) in self.units.iter().enumerate() {
+            // Only simulate physics/pathfinding for MY units
+            if Some(unit.owner_id) != my_id {
+                // Remote units: Just lerp to target if they have a path (which we use as target state)
+                // Wait, we don't get paths for remote units via UnitMove anymore (we will use Sync).
+                // But UnitMove sets path.
+                // For now, let's rely on UnitSync to snap/lerp them.
+                // If we have a path (from UnitMove), we can follow it, but we trust UnitSync more.
+                
+                // Actually, let's just let remote units sit still unless we get a Sync/Move.
+                // If we get UnitMove, we calculate path.
+                // So we CAN simulate them, but we must be ready to SNAP when Sync arrives.
+                // Let's simulate them for smoothness, but the Sync will correct us.
+            }
+
             let mut dx = 0.0;
             let mut dy = 0.0;
             let mut should_pop = false;
@@ -453,48 +551,58 @@ impl GameState {
                 }
             }
 
-            // Separation
-            for (j, other_pos) in unit_positions.iter().enumerate() {
-                if i == j { continue; }
-                let ox = unit.x - other_pos.0;
-                let oy = unit.y - other_pos.1;
-                let dist_sq = ox*ox + oy*oy;
-                if dist_sq < separation_radius * separation_radius && dist_sq > 0.0001 {
-                    let dist = dist_sq.sqrt();
-                    dx += (ox / dist) * separation_force;
-                    dy += (oy / dist) * separation_force;
+            // Separation (Only for my units to avoid jittering remote ones?)
+            if Some(unit.owner_id) == my_id {
+                for (j, other_pos) in unit_positions.iter().enumerate() {
+                    if i == j { continue; }
+                    let ox = unit.x - other_pos.0;
+                    let oy = unit.y - other_pos.1;
+                    let dist_sq = ox*ox + oy*oy;
+                    if dist_sq < separation_radius * separation_radius && dist_sq > 0.0001 {
+                        let dist = dist_sq.sqrt();
+                        dx += (ox / dist) * separation_force;
+                        dy += (oy / dist) * separation_force;
+                    }
                 }
             }
 
             let new_x = unit.x + dx;
             let new_y = unit.y + dy;
 
-            // Collision
-            let cx = new_x + 3.0;
-            let cy = new_y + 5.0;
-            let tx = (cx / TILE_SIZE_BASE).floor() as i32;
-            let ty = (cy / TILE_SIZE_BASE).floor() as i32;
-
-            if self.is_tile_walkable(tx, ty) {
-                updates.push((i, new_x, new_y, should_pop));
-            } else {
-                // Slide (Simplified)
-                 let mut final_x = unit.x;
-                let mut final_y = unit.y;
-
-                let cx_x = (unit.x + dx) + 3.0;
-                let cy_curr = unit.y + 5.0;
-                if self.is_tile_walkable((cx_x / TILE_SIZE_BASE).floor() as i32, (cy_curr / TILE_SIZE_BASE).floor() as i32) {
-                    final_x += dx;
-                }
-
-                let cx_curr = final_x + 3.0;
-                let cy_y = (unit.y + dy) + 5.0;
-                if self.is_tile_walkable((cx_curr / TILE_SIZE_BASE).floor() as i32, (cy_y / TILE_SIZE_BASE).floor() as i32) {
-                    final_y += dy;
-                }
+            // Collision & Apply
+            // Only do collision logic for MY units to prevent getting stuck on things that server says are fine
+            if Some(unit.owner_id) == my_id {
+                // Reveal Fog of War moved to start of function
                 
-                updates.push((i, final_x, final_y, should_pop));
+                let cx = new_x + 3.0;
+                let cy = new_y + 5.0;
+                let tx = (cx / TILE_SIZE_BASE).floor() as i32;
+                let ty = (cy / TILE_SIZE_BASE).floor() as i32;
+
+                if self.is_tile_walkable(tx, ty) {
+                    updates.push((i, new_x, new_y, should_pop));
+                } else {
+                    // Slide (Simplified)
+                     let mut final_x = unit.x;
+                    let mut final_y = unit.y;
+
+                    let cx_x = (unit.x + dx) + 3.0;
+                    let cy_curr = unit.y + 5.0;
+                    if self.is_tile_walkable((cx_x / TILE_SIZE_BASE).floor() as i32, (cy_curr / TILE_SIZE_BASE).floor() as i32) {
+                        final_x += dx;
+                    }
+
+                    let cx_curr = final_x + 3.0;
+                    let cy_y = (unit.y + dy) + 5.0;
+                    if self.is_tile_walkable((cx_curr / TILE_SIZE_BASE).floor() as i32, (cy_y / TILE_SIZE_BASE).floor() as i32) {
+                        final_y += dy;
+                    }
+                    
+                    updates.push((i, final_x, final_y, should_pop));
+                }
+            } else {
+                // Remote units just move (no collision check on client, trust source)
+                updates.push((i, new_x, new_y, should_pop));
             }
         }
 
@@ -503,6 +611,38 @@ impl GameState {
             u.x = x;
             u.y = y;
             if pop { u.path.pop(); }
+        }
+        
+        // --- SYNC LOGIC ---
+        // Send UnitSync for MY units every 100ms
+        let now = web_sys::window().unwrap().performance().unwrap().now();
+        if now - self.last_sync_time > 100.0 {
+            if let Some(ws) = &self.socket {
+                // Only send if OPEN (Ready State 1)
+                if ws.ready_state() == 1 {
+                    let my_id = if let Some(id) = self.my_id { id } else { return };
+                    
+                    let mut my_unit_idx = 0;
+                    for u in &self.units {
+                        if u.owner_id == my_id {
+                            let msg = GameMessage::UnitSync {
+                                player_id: my_id,
+                                unit_idx: my_unit_idx,
+                                x: u.x,
+                                y: u.y
+                            };
+                            
+                             if let Ok(json) = serde_json::to_string(&msg) {
+                                 // Safe to send due to ready_state check, but Result ignored
+                                 let _ = ws.send_with_str(&json);
+                             }
+                             
+                            my_unit_idx += 1;
+                        }
+                    }
+                }
+            }
+            self.last_sync_time = now;
         }
     }
 
@@ -516,11 +656,118 @@ impl GameState {
     }
 
     fn handle_click(&mut self, screen_x: f32, screen_y: f32) {
-        let (wx, wy) = self.screen_to_world(screen_x, screen_y);
         let my_id = if let Some(id) = self.my_id { id } else { return };
+        
+        // --- UI CLICK HANDLING ---
+        let footer_height = 100.0;
+        if screen_y > HEIGHT as f32 - footer_height {
+            // Click is in Footer
+            
+            // 1. Check Home Button (Center)
+            let home_btn_size = 60.0;
+            let home_btn_x = (WIDTH as f32 - home_btn_size) / 2.0;
+            let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - home_btn_size) / 2.0;
+            
+            if screen_x >= home_btn_x && screen_x <= home_btn_x + home_btn_size &&
+               screen_y >= home_btn_y && screen_y <= home_btn_y + home_btn_size {
+                   
+                   // Select Town Center
+                   for (i, b) in self.buildings.iter().enumerate() {
+                       if b.owner_id == my_id {
+                           self.selected_building = Some(i);
+                           // Deselect units
+                           for u in &mut self.units { u.selected = false; }
+                           
+                           // Center Camera
+                           let bx = b.tile_x as f32 * TILE_SIZE_BASE;
+                           let by = b.tile_y as f32 * TILE_SIZE_BASE;
+                           
+                           // We want bx, by to be at center of screen
+                           // World = (Screen - Center)/Zoom + Camera
+                           // Camera = World - (Screen - Center)/Zoom
+                           // Camera = bx - 0 (since screen center is center)
+                           
+                           // Reset Zoom for "Home" feel? Or keep current zoom?
+                           // User said "like on page load". Page load defaults to zoom 1.0.
+                           // Let's reset zoom to 1.0 for consistent "Home" behavior.
+                           self.target_zoom = 1.0;
+                           
+                           // We need to set camera AFTER zoom stabilizes or calculate for target zoom?
+                           // If we just set camera to bx, by, it centers 0,0 of world to center of screen?
+                           // No, camera_x/y is the world coordinate at the CENTER of the screen.
+                           self.camera_x = bx;
+                           self.camera_y = by;
+                           
+                           break;
+                       }
+                   }
+                   return;
+            }
+
+            // 2. Check Spawn Button (Left) - Only if building selected
+            if let Some(b_idx) = self.selected_building {
+                // Only if Town Center
+                if b_idx < self.buildings.len() && self.buildings[b_idx].kind == 0 {
+                    let spawn_btn_size = 60.0;
+                    let spawn_btn_x = 20.0;
+                    let spawn_btn_y = HEIGHT as f32 - footer_height + (footer_height - spawn_btn_size) / 2.0;
+                    
+                    if screen_x >= spawn_btn_x && screen_x <= spawn_btn_x + spawn_btn_size &&
+                       screen_y >= spawn_btn_y && screen_y <= spawn_btn_y + spawn_btn_size {
+                           
+                        // Send Spawn Request
+                        if let Some(ws) = &self.socket {
+                             let msg = GameMessage::SpawnUnit;
+                             if let Ok(json) = serde_json::to_string(&msg) {
+                                 let _ = ws.send_with_str(&json);
+                             }
+                        }
+                    }
+                }
+            }
+            
+            // 3. Check Build Wall Button (Left) - Only if unit selected AND no building selected
+            if self.selected_building.is_none() {
+                let mut selected_unit_idx = None;
+                for (i, u) in self.units.iter().enumerate() {
+                    if u.selected && Some(u.owner_id) == Some(my_id) {
+                        selected_unit_idx = Some(i);
+                        break;
+                    }
+                }
+                
+                if let Some(idx) = selected_unit_idx {
+                    let build_btn_size = 60.0;
+                    let build_btn_x = 20.0;
+                    let build_btn_y = HEIGHT as f32 - footer_height + (footer_height - build_btn_size) / 2.0;
+                    
+                    if screen_x >= build_btn_x && screen_x <= build_btn_x + build_btn_size &&
+                       screen_y >= build_btn_y && screen_y <= build_btn_y + build_btn_size {
+                           
+                        // Build Wall at Unit Location (Snapped to Grid)
+                        let u = &self.units[idx];
+                        let tx = (u.x / TILE_SIZE_BASE).floor() as i32;
+                        let ty = (u.y / TILE_SIZE_BASE).floor() as i32;
+                        
+                        // Send Build Request
+                        if let Some(ws) = &self.socket {
+                             let msg = GameMessage::Build { kind: 1, tile_x: tx, tile_y: ty };
+                             if let Ok(json) = serde_json::to_string(&msg) {
+                                 let _ = ws.send_with_str(&json);
+                             }
+                        }
+                    }
+                }
+            }
+            return; // Swallow click if in UI area
+        }
+        
+        // --- WORLD CLICK HANDLING ---
+        let (wx, wy) = self.screen_to_world(screen_x, screen_y);
 
         let mut clicked_unit = false;
         
+        // 1. Try Select Unit
         for unit in &mut self.units {
             if unit.owner_id != my_id { continue; }
 
@@ -532,52 +779,93 @@ impl GameState {
             if dx < 10.0 && dy < 10.0 {
                 unit.selected = !unit.selected;
                 clicked_unit = true;
+                self.selected_building = None; // Deselect building
                 break;
             }
         }
 
         if !clicked_unit {
-            // Move command
-            let mut paths = Vec::new();
-            let mut move_commands = Vec::new();
+            // 2. Try Select Building
+            let mut clicked_building = false;
+            for (i, b) in self.buildings.iter().enumerate() {
+                if b.owner_id != my_id { continue; }
+                
+                let bx = b.tile_x as f32 * TILE_SIZE_BASE;
+                let by = b.tile_y as f32 * TILE_SIZE_BASE;
+                let size = TILE_SIZE_BASE * 2.5; // Increased hitbox from 1.5 to 2.5 for easier selection
+                
+                // Hitbox centered on building
+                if wx >= bx - size/2.0 && wx <= bx + size/2.0 &&
+                   wy >= by - size/2.0 && wy <= by + size/2.0 {
+                       self.selected_building = Some(i);
+                       clicked_building = true;
+                       
+                       // Deselect all units
+                       for u in &mut self.units { u.selected = false; }
+                       break;
+                   }
+            }
             
-            // First, calculate paths for local update
-            for (i, unit) in self.units.iter().enumerate() {
-                if unit.selected && unit.owner_id == my_id {
-                    let path = self.find_path((unit.x, unit.y), (wx, wy));
-                    if !path.is_empty() {
-                        paths.push((i, path));
-                        
-                        // Calculate relative index for this unit within my units
-                        let mut my_unit_idx = 0;
-                        for (k, u) in self.units.iter().enumerate() {
-                            if u.owner_id == my_id {
-                                if k == i { break; }
-                                my_unit_idx += 1;
+            if !clicked_building {
+                // Clear selections if clicking empty ground (unless moving units)
+                // If units are selected, we Move. If not, we clear building selection.
+                
+                let any_unit_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
+                
+                if !any_unit_selected {
+                    self.selected_building = None;
+                } else {
+                    // Move command logic...
+                    // ... (existing move logic) ...
+                    
+                    let mut paths = Vec::new();
+                    let mut move_commands = Vec::new();
+                    
+                    // Collect selected unit data first to avoid borrowing conflict
+                    let mut selected_units = Vec::new();
+                    for (i, unit) in self.units.iter().enumerate() {
+                        if unit.selected && unit.owner_id == my_id {
+                            selected_units.push((i, unit.x, unit.y));
+                        }
+                    }
+        
+                    // Now calculate paths (mut borrow ok here)
+                    for (i, start_x, start_y) in selected_units {
+                        let path = self.find_path((start_x, start_y), (wx, wy));
+                        if !path.is_empty() {
+                            paths.push((i, path));
+                            
+                            // Calculate relative index for this unit within my units
+                            let mut my_unit_idx = 0;
+                            for (k, u) in self.units.iter().enumerate() {
+                                if u.owner_id == my_id {
+                                    if k == i { break; }
+                                    my_unit_idx += 1;
+                                }
+                            }
+                            
+                            move_commands.push((my_unit_idx, wx, wy));
+                        }
+                    }
+                    
+                    // Update local state
+                    for (i, path) in paths {
+                        self.units[i].path = path;
+                    }
+                    
+                    // Send commands
+                    if let Some(ws) = &self.socket {
+                        for (idx, tx, ty) in move_commands {
+                            let msg = GameMessage::UnitMove { 
+                                player_id: my_id, 
+                                unit_idx: idx, 
+                                x: tx, 
+                                y: ty 
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = ws.send_with_str(&json);
                             }
                         }
-                        
-                        move_commands.push((my_unit_idx, wx, wy));
-                    }
-                }
-            }
-            
-            // Update local state
-            for (i, path) in paths {
-                self.units[i].path = path;
-            }
-            
-            // Send commands
-            if let Some(ws) = &self.socket {
-                for (idx, tx, ty) in move_commands {
-                    let msg = GameMessage::UnitMove { 
-                        player_id: my_id, 
-                        unit_idx: idx, 
-                        x: tx, 
-                        y: ty 
-                    };
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        let _ = ws.send_with_str(&json);
                     }
                 }
             }
@@ -588,24 +876,43 @@ impl GameState {
         // 1. Project mouse screen coords to world coords *before* zoom
         let (world_x, world_y) = self.screen_to_world(mouse_x, mouse_y);
 
-        // 2. Apply Zoom
+        // 2. Apply Zoom to Target
         let sensitivity = 0.001;
-        let new_zoom = self.zoom - delta_y * sensitivity;
-        // Allow infinite zoom out practically (0.01)
-        let new_zoom = new_zoom.clamp(0.01, 10.0);
+        // Invert delta_y for natural scroll, clamp target
+        let new_zoom = self.target_zoom - delta_y * sensitivity;
+        self.target_zoom = new_zoom.clamp(0.05, 5.0); // Slightly tighter bounds
         
-        if (new_zoom - self.zoom).abs() < 0.0001 { return; }
-        self.zoom = new_zoom;
-
-        // 3. We want (world_x, world_y) to still be under (mouse_x, mouse_y)
-        // New World calc: (screen - center) / new_zoom + new_cam = world
-        // Therefore: new_cam = world - (screen - center) / new_zoom
+        // 3. Adjust Camera to keep mouse centered (This is tricky with smooth zoom because camera update needs to happen during the lerp)
+        // For now, let's just zoom to center of screen to simplify smooth zoom behavior, 
+        // or we can try to adjust camera target? 
+        // Simple "Google Maps" style zoom usually zooms to mouse pointer.
+        // To do this smoothly, we need to lerp the camera position too?
+        // Actually, if we just change zoom, the screen_to_world calculation changes.
+        // Let's just stick to smooth zoom level for now, but maybe centering is jarring if not immediate.
+        // Let's TRY keeping the camera update immediate but zoom value lagged? No, that wiggles.
+        // Let's just apply the camera shift immediately based on the *intended* zoom change?
         
-        let center_x = WIDTH as f32 / 2.0;
-        let center_y = HEIGHT as f32 / 2.0;
+        // Standard RTS zoom usually just zooms to center of screen if using keyboard, or mouse if using wheel.
+        // Let's simplify: Zoom towards center of screen for smoothness.
+        // Or just accept that smooth zoom + mouse targeting requires complex tweening of both variables.
         
-        self.camera_x = world_x - (mouse_x - center_x) / self.zoom;
-        self.camera_y = world_y - (mouse_y - center_y) / self.zoom;
+        // Re-implementation:
+        // We just set target_zoom. 
+        // The update() loop handles the `zoom` value.
+        // We also need to drift `camera_x/y` so that `world_x,world_y` stays at `mouse_x,mouse_y`.
+        // That's hard to do statelessly in `handle_zoom`.
+        
+        // Let's just do immediate camera adjustment for the *target* zoom?
+        // No, that will jump the camera.
+        
+        // Let's stick to immediate zoom for now but just interpolate the value? 
+        // User said "clunky", which usually means the steps are too big or it snaps.
+        // LERPing the zoom value is the standard fix.
+        // But we must abandon "zoom to mouse cursor" if we can't lerp the camera too.
+        // Let's switch to "Zoom to Center" for consistent smooth feel.
+        
+        // ... Wait, user said "chunky clunky". 
+        // Maybe just lower sensitivity and use LERP is enough.
     }
 
     fn handle_touch_zoom(&mut self, dist: f32, center_x: f32, center_y: f32) {
@@ -666,6 +973,7 @@ pub fn run_game() -> Result<(), JsValue> {
     {
         let ws_clone = ws.clone();
         let onopen_callback = Closure::wrap(Box::new(move || {
+             log("WS Connected. Sending Handshake...");
              // Get token from localStorage
              let window = web_sys::window().unwrap();
              let storage = window.local_storage().unwrap().unwrap();
@@ -676,6 +984,31 @@ pub fn run_game() -> Result<(), JsValue> {
         }) as Box<dyn FnMut()>);
         ws.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
         onopen_callback.forget();
+    }
+    
+    // OnClose - Handle disconnection (likely due to server restart/update)
+    {
+        let onclose_callback = Closure::wrap(Box::new(move || {
+            log("WS Disconnected. Attempting to reload for update check...");
+            // If server disconnected us, it might be an update.
+            // Reloading the page is the safest way to get new WASM and reconnect.
+            // But we don't want infinite reload loops if server is just down.
+            // For now, let's just show the "Disconnected" status, but maybe a "Reconnecting..." banner?
+            // User asked for "checking if min version matches".
+            
+            // If we just reload, we get the new client.
+            // Let's try a delayed reload.
+            let window = web_sys::window().unwrap();
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                &Closure::wrap(Box::new(move || {
+                    let window = web_sys::window().unwrap();
+                    let _ = window.location().reload();
+                }) as Box<dyn FnMut()>).into_js_value().unchecked_ref(),
+                5000 // Reload after 5 seconds of disconnect
+            );
+        }) as Box<dyn FnMut()>);
+        ws.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
+        onclose_callback.forget();
     }
 
     {
@@ -716,7 +1049,7 @@ pub fn run_game() -> Result<(), JsValue> {
                                 web_sys::window().unwrap().alert_with_message(&message).unwrap();
                             }
                         },
-                        GameMessage::Welcome { player_id, chunk_x, chunk_y, players, units, token } => {
+                        GameMessage::Welcome { player_id, chunk_x, chunk_y, players, units, buildings, token } => {
                             state.my_id = Some(player_id);
                             state.my_chunk_x = chunk_x;
                             state.my_chunk_y = chunk_y;
@@ -728,25 +1061,27 @@ pub fn run_game() -> Result<(), JsValue> {
                             storage.set_item("temty_token", &token).unwrap();
                             
                             // Ensure chunks exist and spawn buildings for ALL players (me + others)
-                            // Note: players includes existing players. Does it include me? 
-                            // Server logic: "existing_players" = values of map BEFORE inserting me (Wait, check server code)
-                            // Server: 
-                            //   gs.players.insert(me); 
-                            //   existing_players = gs.players.values().collect();
-                            // So YES, "players" list in Welcome includes ME.
-                            
                             state.buildings.clear(); // Clear buildings to avoid dupes if any
                             
+                            // 1. Add Implicit Town Centers from Player Chunks
                             for p in &players {
                                 state.generate_chunk(p.chunk_x, p.chunk_y);
-                                
-                                // Spawn Building
                                 let mid = CHUNK_SIZE / 2;
                                 state.buildings.push(Building { 
                                     tile_x: p.chunk_x * CHUNK_SIZE + mid, 
                                     tile_y: p.chunk_y * CHUNK_SIZE + mid, 
                                     kind: 0,
                                     owner_id: p.id
+                                });
+                            }
+                            
+                            // 2. Add Explicit Buildings from DB
+                            for b in buildings {
+                                state.buildings.push(Building {
+                                    tile_x: b.tile_x,
+                                    tile_y: b.tile_y,
+                                    kind: b.kind,
+                                    owner_id: b.owner_id
                                 });
                             }
                             
@@ -814,14 +1149,8 @@ pub fn run_game() -> Result<(), JsValue> {
                                     let max_cx = (max_wx / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
                                     let max_cy = (max_wy / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
 
-                                    // Expand by 1 chunk padding
-                                    for cy in (min_cy - 1)..=(max_cy + 1) {
-                                        for cx in (min_cx - 1)..=(max_cx + 1) {
-                                            if !state.chunks.contains_key(&(cx, cy)) {
-                                                state.generate_chunk(cx, cy);
-                                            }
-                                        }
-                                    }
+                                    // Removed aggressive chunk generation for Fog of War logic
+                                    // Chunks will generate only when units approach them in update()
 
                                     let path = state.find_path((start_x, start_y), (x, y));
                                     state.units[idx].path = path;
@@ -833,6 +1162,62 @@ pub fn run_game() -> Result<(), JsValue> {
                                     }
                                 }
                             }
+                        },
+                        GameMessage::UnitSync { player_id, unit_idx, x, y } => {
+                             if Some(player_id) != state.my_id {
+                                // Snap remote unit to position (or Lerp in future)
+                                let mut count = 0;
+                                for u in &mut state.units {
+                                    if u.owner_id == player_id {
+                                        if count == unit_idx {
+                                            // LERP or SNAP?
+                                            // For now SNAP to ensure sync.
+                                            // To make it smooth, we can apply simple easing:
+                                            // u.x = u.x + (x - u.x) * 0.5; 
+                                            // But let's snap first to fix the "out of sync" complaint.
+                                            
+                                            // Actually, if we only receive 10 updates/sec, snap looks choppy.
+                                            // Let's use a simple smooth approach:
+                                            let dist = ((u.x - x).powi(2) + (u.y - y).powi(2)).sqrt();
+                                            if dist > 50.0 {
+                                                u.x = x;
+                                                u.y = y;
+                                            } else {
+                                                // Smooth lerp (adjust factor for smoothness vs lag)
+                                                u.x += (x - u.x) * 0.2;
+                                                u.y += (y - u.y) * 0.2;
+                                            }
+                                            break;
+                                        }
+                                        count += 1;
+                                    }
+                                }
+                             }
+                        },
+                        GameMessage::SpawnUnit => {}, // Should not happen on client
+                        GameMessage::UnitSpawned { unit } => {
+                            // Add new unit
+                            let color = if Some(unit.owner_id) == state.my_id { (0, 0, 255) } else { (255, 0, 0) };
+                            state.units.push(Unit {
+                                x: unit.x,
+                                y: unit.y,
+                                path: Vec::new(),
+                                selected: false,
+                                kind: 0,
+                                color,
+                                owner_id: unit.owner_id,
+                            });
+                            log("New unit spawned!");
+                        },
+                        GameMessage::Build { .. } => {}, // Should not be received by client, but good for completeness
+                        GameMessage::BuildingSpawned { building } => {
+                            state.buildings.push(Building {
+                                tile_x: building.tile_x,
+                                tile_y: building.tile_y,
+                                kind: building.kind,
+                                owner_id: building.owner_id
+                            });
+                            log("New building spawned!");
                         }
                     }
                 }
@@ -936,9 +1321,15 @@ pub fn run_game() -> Result<(), JsValue> {
     let f = Rc::new(RefCell::new(None));
     let g = f.clone();
 
+    let mut last_time = web_sys::window().unwrap().performance().unwrap().now();
+
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+        let now = web_sys::window().unwrap().performance().unwrap().now();
+        let dt = (now - last_time) / 1000.0;
+        last_time = now;
+
         let mut gs = game_state.borrow_mut();
-        gs.update();
+        gs.update(dt);
 
         buffer.clear(20, 20, 20);
 
@@ -1018,12 +1409,23 @@ pub fn run_game() -> Result<(), JsValue> {
             
             let sx = (bx - cam_x) * zoom + screen_center_x;
             let sy = (by - cam_y) * zoom + screen_center_y;
-            let size = tile_size * 1.5;
-
-            // Color logic: Blue for me, Red for enemy
-            let color = if Some(b.owner_id) == gs.my_id { (0, 0, 255) } else { (255, 0, 0) };
             
-            buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, color.0, color.1, color.2);
+            if b.kind == 0 { // Town Center
+                let size = tile_size * 1.5;
+                let color = if Some(b.owner_id) == gs.my_id { (0, 0, 150) } else { (255, 0, 0) };
+                
+                buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, color.0, color.1, color.2);
+                
+                // Town Center Inner Square (White) - 1/3 size
+                let inner_size = size / 3.0;
+                buffer.rect((sx - inner_size/2.0) as i32, (sy - inner_size/2.0) as i32, inner_size as i32, inner_size as i32, 255, 255, 255);
+            } else if b.kind == 1 { // Wall
+                let size = tile_size;
+                // Wall Color: Stone Gray
+                buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, 100, 100, 100);
+                // Subtle detail
+                buffer.rect((sx - size*0.2) as i32, (sy - size*0.2) as i32, (size*0.4) as i32, (size*0.4) as i32, 120, 120, 120);
+            }
         }
 
         // Render Units
@@ -1084,6 +1486,74 @@ pub fn run_game() -> Result<(), JsValue> {
              
              let size = tile_size * 0.8;
              // buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, 255, 0, 0);
+        }
+        
+        // --- UI OVERLAY (Footer) ---
+        let footer_height = 100.0;
+        // Draw Footer BG
+        buffer.rect(0, (HEIGHT as f32 - footer_height) as i32, WIDTH as i32, footer_height as i32, 40, 40, 40);
+        
+        // Home Button (Center) - ALWAYS VISIBLE
+        let home_btn_size = 60.0;
+        let home_btn_x = (WIDTH as f32 - home_btn_size) / 2.0;
+        let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - home_btn_size) / 2.0;
+        
+        // Darker Blue
+        buffer.rect(home_btn_x as i32, home_btn_y as i32, home_btn_size as i32, home_btn_size as i32, 0, 0, 150);
+        // White Inner Square (Home Icon style)
+        buffer.rect((home_btn_x + 20.0) as i32, (home_btn_y + 20.0) as i32, 20, 20, 255, 255, 255);
+
+        // Draw Selected Building UI (Spawn Button on LEFT)
+        if let Some(b_idx) = gs.selected_building {
+             // Check if it's MY building and it's a Town Center (kind 0)
+             if b_idx < gs.buildings.len() && Some(gs.buildings[b_idx].owner_id) == gs.my_id && gs.buildings[b_idx].kind == 0 {
+                 let spawn_btn_size = 60.0;
+                 let spawn_btn_x = 20.0; // Left aligned with padding
+                 let spawn_btn_y = HEIGHT as f32 - footer_height + (footer_height - spawn_btn_size) / 2.0;
+                 
+                 // Blue Button
+                 buffer.rect(spawn_btn_x as i32, spawn_btn_y as i32, spawn_btn_size as i32, spawn_btn_size as i32, 0, 0, 150);
+                 
+                 // Green Plus Overlay
+                 buffer.rect((spawn_btn_x + 10.0) as i32, (spawn_btn_y + 25.0) as i32, 40, 10, 0, 255, 0);
+                 buffer.rect((spawn_btn_x + 25.0) as i32, (spawn_btn_y + 10.0) as i32, 10, 40, 0, 255, 0);
+             }
+        }
+        
+        // Draw Selected UNIT UI (Build Wall Button on LEFT)
+        // Only if NO building is selected (prioritize building UI if logic overlaps, but they shouldn't)
+        if gs.selected_building.is_none() {
+            let any_unit_selected = gs.units.iter().any(|u| u.selected && Some(u.owner_id) == gs.my_id);
+            if any_unit_selected {
+                 let build_btn_size = 60.0;
+                 let build_btn_x = 20.0;
+                 let build_btn_y = HEIGHT as f32 - footer_height + (footer_height - build_btn_size) / 2.0;
+                 
+                 // Blue Button
+                 buffer.rect(build_btn_x as i32, build_btn_y as i32, build_btn_size as i32, build_btn_size as i32, 0, 0, 150);
+                 
+                 // "Wall" Icon (Gray Square + Green Plus?) 
+                 // User said: "GIVE THEM A + SIGN BUTTON AS WELL... FOR A waller"
+                 // Let's use the Green Plus for now as requested.
+                 buffer.rect((build_btn_x + 10.0) as i32, (build_btn_y + 25.0) as i32, 40, 10, 0, 255, 0);
+                 buffer.rect((build_btn_x + 25.0) as i32, (build_btn_y + 10.0) as i32, 10, 40, 0, 255, 0);
+            }
+        }
+        
+        // Draw Selection Outline for Building
+        if let Some(b_idx) = gs.selected_building {
+            if b_idx < gs.buildings.len() {
+                let b = &gs.buildings[b_idx];
+                let bx = b.tile_x as f32 * TILE_SIZE_BASE;
+                let by = b.tile_y as f32 * TILE_SIZE_BASE;
+                let sx = (bx - cam_x) * zoom + screen_center_x;
+                let sy = (by - cam_y) * zoom + screen_center_y;
+                let size = tile_size * 1.5;
+                
+                // Green Selection Box
+                let box_size = size * 1.2;
+                buffer.rect_outline((sx - box_size/2.0) as i32, (sy - box_size/2.0) as i32, box_size as i32, box_size as i32, 0, 255, 0);
+            }
         }
 
         let image_data = ImageData::new_with_u8_clamped_array_and_sh(

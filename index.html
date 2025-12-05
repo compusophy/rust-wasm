@@ -4,6 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Rust + Wasm Chat</title>
+    
+    <!-- Farcaster MiniApp Meta Tags -->
+    <meta name="fc:miniapp" content='{"version":"1","imageUrl":"https://temty.vercel.app/logo.png","button":{"title":"Play Temty","action":{"type":"launch_frame","name":"Temty","url":"https://temty.vercel.app/","splashImageUrl":"https://temty.vercel.app/logo.png","splashBackgroundColor":"#222222"}}}' />
+    <meta name="fc:frame" content='{"version":"1","imageUrl":"https://temty.vercel.app/logo.png","button":{"title":"Play Temty","action":{"type":"launch_frame","name":"Temty","url":"https://temty.vercel.app/","splashImageUrl":"https://temty.vercel.app/logo.png","splashBackgroundColor":"#222222"}}}' />
+    
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
         body { 
@@ -126,6 +131,7 @@
     </div>
 
     <script type="module">
+        import { sdk } from 'https://esm.sh/@farcaster/miniapp-sdk'
         import init, { ChatClient, run_game } from './pkg/temty.js';
 
         let client;
@@ -153,7 +159,7 @@
         async function start() {
             try {
                 // Cache busting to ensure we load the new WASM version
-                await init('./pkg/temty_bg.wasm?v=8');
+                await init('./pkg/temty_bg.wasm?v=19');
             } catch(e) {
                 console.error("WASM init failed:", e);
                 statusEl.className = 'status-error';
@@ -163,6 +169,8 @@
             // Start the Rust Game Loop
             try {
                 run_game();
+                // Signal Farcaster MiniApp is ready and disable native gestures (swipe-to-back)
+                sdk.actions.ready({ disableNativeGestures: true });
             } catch(e) {
                 console.error("Game loop failed to start:", e);
                 // Continue to chat even if game fails

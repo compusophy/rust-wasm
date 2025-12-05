@@ -3,4 +3,3 @@ pkg/
 **/*.rs.bk
 
 .vercel
-.env
