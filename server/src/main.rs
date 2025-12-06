@@ -124,23 +124,26 @@ impl GlobalState {
     }
 
     fn spawn_units(cx: i32, cy: i32) -> Vec<UnitState> {
-        let chunk_size = 32.0; // New chunk size 32
+        let chunk_size = 32.0;
         let tile_size = 16.0;
         
-        // Calculate Center of Chunk in World Coords
-        let sx = (cx as f32 * chunk_size * tile_size) + (chunk_size * tile_size / 2.0);
-        let sy = (cy as f32 * chunk_size * tile_size) + (chunk_size * tile_size / 2.0);
+        // Town Center is at tile (cx * chunk_size + mid, cy * chunk_size + mid)
+        // where mid = chunk_size / 2 = 16
+        // Its TOP-LEFT in world coords is that tile * tile_size
+        let mid = chunk_size / 2.0;
+        let tc_tile_x = cx as f32 * chunk_size + mid;
+        let tc_tile_y = cy as f32 * chunk_size + mid;
         
-        // Offsets for units (relative to center)
-        // We need to make sure these don't hit the center building (at 0,0 relative offset)
-        // Building size is roughly tile_size * 1.5 (24px)
+        // Town Center occupies 1 tile (16x16 px) starting from its TOP-LEFT
+        // Spawn units below and to the right of the Town Center
+        let tc_world_x = tc_tile_x * tile_size;
+        let tc_world_y = tc_tile_y * tile_size;
         
-        // Unit 1: Offset by 40px (2.5 tiles) right, 40px down
-        // Unit 2: Offset by 40px left, 40px down
-        
+        // Unit positions: offset from Town Center's top-left
+        // Place them 2 tiles below the TC, spread horizontally
         vec![
-            UnitState { x: sx + 40.0, y: sy + 40.0 },
-            UnitState { x: sx - 40.0, y: sy + 40.0 },
+            UnitState { x: tc_world_x + tile_size * 0.5, y: tc_world_y + tile_size * 2.0 },
+            UnitState { x: tc_world_x + tile_size * 1.5, y: tc_world_y + tile_size * 2.0 },
         ]
     }
 }
@@ -684,20 +687,24 @@ async fn handle_connection(
                                 return;
                             }
                             
-                            // Calculate Spawn Pos (Near Center of their chunk)
+                            // Calculate Spawn Pos (Near Town Center)
                             let chunk_size = 32.0;
                             let tile_size = 16.0;
-                            let center_x = (chunk_x as f32 * chunk_size * tile_size) + (chunk_size * tile_size / 2.0);
-                            let center_y = (chunk_y as f32 * chunk_size * tile_size) + (chunk_size * tile_size / 2.0);
+                            let mid = chunk_size / 2.0;
                             
-                            // Random offset to avoid stacking
-                            // Simple spiral or just random nearby
-                            // Let's just put it slightly below the building
-                            let offset_x = ((next_idx as f32 % 3.0) - 1.0) * 20.0;
-                            let offset_y = 50.0 + (next_idx as f32 / 3.0).floor() * 20.0;
+                            // Town Center tile position
+                            let tc_tile_x = chunk_x as f32 * chunk_size + mid;
+                            let tc_tile_y = chunk_y as f32 * chunk_size + mid;
                             
-                            let spawn_x = center_x + offset_x;
-                            let spawn_y = center_y + offset_y;
+                            // Town Center world position (TOP-LEFT of tile)
+                            let tc_world_x = tc_tile_x * tile_size;
+                            let tc_world_y = tc_tile_y * tile_size;
+                            
+                            // Spawn below TC, spread horizontally based on unit index
+                            let col = (next_idx % 3) as f32;
+                            let row = (next_idx / 3) as f32;
+                            let spawn_x = tc_world_x + (col * tile_size);
+                            let spawn_y = tc_world_y + tile_size * 2.0 + (row * tile_size);
                             
                             // 1. Update DB
                             if let Some(p) = &recv_pool {

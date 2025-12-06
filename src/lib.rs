@@ -255,6 +255,12 @@ struct GameState {
     drag_start: Option<(f32, f32)>,  // Screen coords
     drag_current: Option<(f32, f32)>, // Screen coords
     
+    // Build Mode (wall placement)
+    build_mode: bool,
+    wall_start: Option<(i32, i32)>,  // Tile coords - first point
+    wall_end: Option<(i32, i32)>,    // Tile coords - second point
+    wall_preview: Vec<(i32, i32)>,   // Preview tiles to build
+    
     // Sync
     last_sync_time: f64,
     
@@ -286,6 +292,10 @@ impl GameState {
             group_select_mode: false,
             drag_start: None,
             drag_current: None,
+            build_mode: false,
+            wall_start: None,
+            wall_end: None,
+            wall_preview: Vec::new(),
             last_sync_time: 0.0,
             target_zoom: 1.0,
         };
@@ -386,9 +396,9 @@ impl GameState {
             None => return false, // Should be covered by chunk check above
         }
         
-        // Check Buildings
+        // Check Buildings - each building occupies exactly 1 tile
         for b in &self.buildings {
-            if gx >= b.tile_x - 1 && gx <= b.tile_x + 1 && gy >= b.tile_y - 1 && gy <= b.tile_y + 1 {
+            if gx == b.tile_x && gy == b.tile_y {
                 return false;
             }
         }
@@ -678,7 +688,30 @@ impl GameState {
         let now = web_sys::window().unwrap().performance().unwrap().now();
         
         // --- UI CLICK HANDLING ---
-        let footer_height = 60.0; // Reduced from 100
+        let footer_height = 60.0;
+        let unit_icon_size = 20.0;
+        let icons_y = HEIGHT as f32 - footer_height - unit_icon_size - 5.0;
+        
+        // Check Selected Unit Icons (above footer) - click to deselect
+        if screen_y >= icons_y && screen_y <= icons_y + unit_icon_size {
+            // Get selected units with their indices
+            let selected_indices: Vec<usize> = self.units.iter()
+                .enumerate()
+                .filter(|(_, u)| u.selected && u.owner_id == my_id)
+                .map(|(i, _)| i)
+                .collect();
+            
+            let max_display = 10;
+            for (i, &unit_idx) in selected_indices.iter().take(max_display).enumerate() {
+                let icon_x = 10.0 + (i as f32 * (unit_icon_size + 4.0));
+                if screen_x >= icon_x && screen_x <= icon_x + unit_icon_size {
+                    // Deselect this unit
+                    self.units[unit_idx].selected = false;
+                    return;
+                }
+            }
+        }
+        
         if screen_y > HEIGHT as f32 - footer_height {
             // Click is in Footer
             
@@ -745,29 +778,66 @@ impl GameState {
                     
                     if screen_x >= build_btn_x && screen_x <= build_btn_x + btn_size &&
                        screen_y >= build_btn_y && screen_y <= build_btn_y + btn_size {
-                        // Find first selected unit for build location
-                        for u in &self.units {
-                            if u.selected && u.owner_id == my_id {
-                                let tx = (u.x / TILE_SIZE_BASE).floor() as i32;
-                                let ty = (u.y / TILE_SIZE_BASE).floor() as i32;
-                                if let Some(ws) = &self.socket {
-                                     let msg = GameMessage::Build { kind: 1, tile_x: tx, tile_y: ty };
-                                     if let Ok(json) = serde_json::to_string(&msg) {
-                                         let _ = ws.send_with_str(&json);
-                                     }
-                                }
-                                break;
-                            }
+                        // Toggle build mode
+                        self.build_mode = !self.build_mode;
+                        if !self.build_mode {
+                            // Clear wall placement state when exiting build mode
+                            self.wall_start = None;
+                            self.wall_end = None;
+                            self.wall_preview.clear();
                         }
                         return;
                     }
                 }
             }
+            
+            // 5. Check Confirm/Cancel buttons (when wall placement is ready)
+            if self.build_mode && self.wall_end.is_some() {
+                // Confirm button (green check) - right side of footer
+                let confirm_btn_x = WIDTH as f32 - btn_size - 60.0;
+                let confirm_btn_y = home_btn_y;
+                
+                if screen_x >= confirm_btn_x && screen_x <= confirm_btn_x + btn_size &&
+                   screen_y >= confirm_btn_y && screen_y <= confirm_btn_y + btn_size {
+                    self.confirm_wall_build();
+                    return;
+                }
+                
+                // Cancel button (red X) - right of confirm
+                let cancel_btn_x = WIDTH as f32 - btn_size - 10.0;
+                let cancel_btn_y = home_btn_y;
+                
+                if screen_x >= cancel_btn_x && screen_x <= cancel_btn_x + btn_size &&
+                   screen_y >= cancel_btn_y && screen_y <= cancel_btn_y + btn_size {
+                    self.cancel_wall_build();
+                    return;
+                }
+            }
+            
             return; // Swallow click if in UI area
         }
         
         // --- WORLD CLICK HANDLING ---
         let (wx, wy) = self.screen_to_world(screen_x, screen_y);
+        let clicked_tile_x = (wx / TILE_SIZE_BASE).floor() as i32;
+        let clicked_tile_y = (wy / TILE_SIZE_BASE).floor() as i32;
+        
+        // Handle Build Mode (wall placement)
+        if self.build_mode {
+            if self.wall_start.is_none() {
+                // First click: set start point
+                self.wall_start = Some((clicked_tile_x, clicked_tile_y));
+                self.wall_preview.clear();
+                return;
+            } else if self.wall_end.is_none() {
+                // Second click: set end point and generate preview
+                self.wall_end = Some((clicked_tile_x, clicked_tile_y));
+                self.generate_wall_preview();
+                return;
+            }
+            // If both are set, clicks go to confirm buttons (handled in UI)
+            return;
+        }
         
         // Double-click detection (300ms window, 20px tolerance)
         let is_double_click = (now - self.last_click_time) < 300.0 &&
@@ -814,12 +884,14 @@ impl GameState {
             for (i, b) in self.buildings.iter().enumerate() {
                 if b.owner_id != my_id { continue; }
                 
-                let bx = b.tile_x as f32 * TILE_SIZE_BASE;
-                let by = b.tile_y as f32 * TILE_SIZE_BASE;
-                let size = TILE_SIZE_BASE * 1.5;
+                // Buildings use TOP-LEFT based positioning (same as tiles)
+                let tile_left = b.tile_x as f32 * TILE_SIZE_BASE;
+                let tile_top = b.tile_y as f32 * TILE_SIZE_BASE;
+                let tile_right = tile_left + TILE_SIZE_BASE;
+                let tile_bottom = tile_top + TILE_SIZE_BASE;
                 
-                if wx >= bx - size/2.0 && wx <= bx + size/2.0 &&
-                   wy >= by - size/2.0 && wy <= by + size/2.0 {
+                if wx >= tile_left && wx <= tile_right &&
+                   wy >= tile_top && wy <= tile_bottom {
                        self.selected_building = Some(i);
                        clicked_building = true;
                        for u in &mut self.units { u.selected = false; }
@@ -922,10 +994,116 @@ impl GameState {
             }
             
             self.selected_building = None;
+            
+            // Auto-disable group select mode after selection is made
+            self.group_select_mode = false;
         }
         
         self.drag_start = None;
         self.drag_current = None;
+    }
+    
+    fn generate_wall_preview(&mut self) {
+        self.wall_preview.clear();
+        
+        if let (Some(start), Some(end)) = (self.wall_start, self.wall_end) {
+            // Generate line of tiles using Bresenham's line algorithm
+            let (x0, y0) = start;
+            let (x1, y1) = end;
+            
+            let dx = (x1 - x0).abs();
+            let dy = -(y1 - y0).abs();
+            let sx = if x0 < x1 { 1 } else { -1 };
+            let sy = if y0 < y1 { 1 } else { -1 };
+            let mut err = dx + dy;
+            
+            let mut x = x0;
+            let mut y = y0;
+            
+            loop {
+                // Check if this tile is buildable
+                if self.is_tile_buildable(x, y) {
+                    self.wall_preview.push((x, y));
+                }
+                
+                if x == x1 && y == y1 { break; }
+                
+                let e2 = 2 * err;
+                if e2 >= dy {
+                    err += dy;
+                    x += sx;
+                }
+                if e2 <= dx {
+                    err += dx;
+                    y += sy;
+                }
+            }
+        }
+    }
+    
+    fn is_tile_buildable(&self, tx: i32, ty: i32) -> bool {
+        // Check buildings (Town Center, existing walls)
+        for b in &self.buildings {
+            if b.tile_x == tx && b.tile_y == ty {
+                return false;
+            }
+        }
+        
+        // Check units
+        for u in &self.units {
+            let utx = (u.x / TILE_SIZE_BASE).floor() as i32;
+            let uty = (u.y / TILE_SIZE_BASE).floor() as i32;
+            if utx == tx && uty == ty {
+                return false;
+            }
+        }
+        
+        // Check terrain using the tile type (Forest, Mountain, Gold, Water = blocked)
+        let cx = tx.div_euclid(CHUNK_SIZE);
+        let cy = ty.div_euclid(CHUNK_SIZE);
+        let lx = tx.rem_euclid(CHUNK_SIZE);
+        let ly = ty.rem_euclid(CHUNK_SIZE);
+        
+        if let Some(chunk) = self.chunks.get(&(cx, cy)) {
+            let idx = (ly * CHUNK_SIZE + lx) as usize;
+            if idx < chunk.tiles.len() {
+                return matches!(chunk.tiles[idx], TileType::Grass);
+            }
+        }
+        
+        // Chunk doesn't exist - use calculate_tile_type to check
+        let tile_type = Self::calculate_tile_type(cx, cy, lx, ly);
+        matches!(tile_type, TileType::Grass)
+    }
+    
+    fn confirm_wall_build(&mut self) {
+        if self.wall_preview.is_empty() {
+            self.cancel_wall_build();
+            return;
+        }
+        
+        // Send build commands for each tile in preview
+        if let Some(ws) = &self.socket {
+            for (tx, ty) in &self.wall_preview {
+                let msg = GameMessage::Build { kind: 1, tile_x: *tx, tile_y: *ty };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    let _ = ws.send_with_str(&json);
+                }
+            }
+        }
+        
+        // Reset build state
+        self.build_mode = false;
+        self.wall_start = None;
+        self.wall_end = None;
+        self.wall_preview.clear();
+    }
+    
+    fn cancel_wall_build(&mut self) {
+        self.wall_start = None;
+        self.wall_end = None;
+        self.wall_preview.clear();
+        // Keep build_mode on so user can try again
     }
     
     fn handle_zoom(&mut self, delta_y: f32, mouse_x: f32, mouse_y: f32) {
@@ -1527,29 +1705,91 @@ pub fn run_game() -> Result<(), JsValue> {
             }
         }
 
-        // Render Buildings
+        // Render Buildings (using TOP-LEFT positioning like tiles)
         for b in &gs.buildings {
-            let bx = b.tile_x as f32 * TILE_SIZE_BASE;
-            let by = b.tile_y as f32 * TILE_SIZE_BASE;
+            // tile_x, tile_y is the tile position - render at TOP-LEFT like terrain
+            let tile_world_x = b.tile_x as f32 * TILE_SIZE_BASE;
+            let tile_world_y = b.tile_y as f32 * TILE_SIZE_BASE;
             
-            let sx = (bx - cam_x) * zoom + screen_center_x;
-            let sy = (by - cam_y) * zoom + screen_center_y;
+            let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
+            let sy = (tile_world_y - cam_y) * zoom + screen_center_y;
             
-            if b.kind == 0 { // Town Center
-                let size = tile_size * 1.5;
+            if b.kind == 0 { // Town Center - 1 tile, same size as everything else
+                let size = tile_size;
                 let color = if Some(b.owner_id) == gs.my_id { (0, 0, 150) } else { (255, 0, 0) };
                 
-                buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, color.0, color.1, color.2);
+                // Render at TOP-LEFT (same as tiles)
+                buffer.rect(sx as i32, sy as i32, size.ceil() as i32, size.ceil() as i32, color.0, color.1, color.2);
                 
-                // Town Center Inner Square (White) - 1/3 size
-                let inner_size = size / 3.0;
-                buffer.rect((sx - inner_size/2.0) as i32, (sy - inner_size/2.0) as i32, inner_size as i32, inner_size as i32, 255, 255, 255);
-            } else if b.kind == 1 { // Wall
+                // Inner detail
+                let inner = size * 0.4;
+                let offset = size * 0.3;
+                buffer.rect((sx + offset) as i32, (sy + offset) as i32, inner.ceil() as i32, inner.ceil() as i32, 255, 255, 255);
+            } else if b.kind == 1 { // Wall - 2x2 brick pattern, colored by owner
                 let size = tile_size;
-                // Wall Color: Stone Gray
-                buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, 100, 100, 100);
-                // Subtle detail
-                buffer.rect((sx - size*0.2) as i32, (sy - size*0.2) as i32, (size*0.4) as i32, (size*0.4) as i32, 120, 120, 120);
+                let gap = 1.0_f32.max(size * 0.05);
+                let sq = ((size - gap) / 2.0).floor() as i32;
+                let base_x = sx as i32;
+                let base_y = sy as i32;
+                let g = gap.ceil() as i32;
+                
+                // Blue for my walls, red for enemy walls
+                let (c1, c2) = if Some(b.owner_id) == gs.my_id {
+                    // Blue bricks (lighter/darker alternating)
+                    ((80, 80, 180), (50, 50, 140))
+                } else {
+                    // Red bricks (lighter/darker alternating)
+                    ((180, 80, 80), (140, 50, 50))
+                };
+                
+                // 2x2 brick grid with alternating shades
+                buffer.rect(base_x, base_y, sq, sq, c1.0, c1.1, c1.2);
+                buffer.rect(base_x + sq + g, base_y, sq, sq, c2.0, c2.1, c2.2);
+                buffer.rect(base_x, base_y + sq + g, sq, sq, c2.0, c2.1, c2.2);
+                buffer.rect(base_x + sq + g, base_y + sq + g, sq, sq, c1.0, c1.1, c1.2);
+            }
+        }
+        
+        // --- WALL PREVIEW (transparent blue) ---
+        if gs.build_mode {
+            // Helper to draw a blue preview brick at tile position
+            let draw_preview_brick = |buffer: &mut PixelBuffer, tx: i32, ty: i32| {
+                let tile_world_x = tx as f32 * TILE_SIZE_BASE;
+                let tile_world_y = ty as f32 * TILE_SIZE_BASE;
+                let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
+                let sy = (tile_world_y - cam_y) * zoom + screen_center_y;
+                let size = tile_size;
+                let half = (size / 2.0).floor();
+                let gap = 1.0_f32.max(size * 0.05);
+                let sq = ((size - gap) / 2.0).floor() as i32;
+                let base_x = sx as i32;
+                let base_y = sy as i32;
+                let g = gap.ceil() as i32;
+                
+                // Blue preview bricks (same pattern as real walls)
+                buffer.rect(base_x, base_y, sq, sq, 50, 100, 200);
+                buffer.rect(base_x + sq + g, base_y, sq, sq, 40, 80, 180);
+                buffer.rect(base_x, base_y + sq + g, sq, sq, 40, 80, 180);
+                buffer.rect(base_x + sq + g, base_y + sq + g, sq, sq, 50, 100, 200);
+            };
+            
+            // Draw start point as blue preview (not just outline)
+            if let Some((tx, ty)) = gs.wall_start {
+                if gs.wall_end.is_none() {
+                    // Only start is set - show single blue preview brick
+                    draw_preview_brick(&mut buffer, tx, ty);
+                    // Green outline around it
+                    let tile_world_x = tx as f32 * TILE_SIZE_BASE;
+                    let tile_world_y = ty as f32 * TILE_SIZE_BASE;
+                    let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
+                    let sy = (tile_world_y - cam_y) * zoom + screen_center_y;
+                    buffer.rect_outline(sx as i32, sy as i32, tile_size.ceil() as i32, tile_size.ceil() as i32, 0, 255, 0);
+                }
+            }
+            
+            // Draw all preview walls (blue translucent)
+            for (tx, ty) in &gs.wall_preview {
+                draw_preview_brick(&mut buffer, *tx, *ty);
             }
         }
 
@@ -1558,33 +1798,30 @@ pub fn run_game() -> Result<(), JsValue> {
             let sx = (u.x - cam_x) * zoom + screen_center_x;
             let sy = (u.y - cam_y) * zoom + screen_center_y;
             
-            // Only render if on screen
+            // Always draw paths for selected units (even if unit is off-screen)
+            if u.selected && !u.path.is_empty() {
+                let mut prev_sx = sx as i32;
+                let mut prev_sy = sy as i32;
+                
+                for point in u.path.iter().rev() {
+                    let p_sx = ((point.0 - cam_x) * zoom + screen_center_x) as i32;
+                    let p_sy = ((point.1 - cam_y) * zoom + screen_center_y) as i32;
+                    
+                    buffer.line(prev_sx, prev_sy, p_sx, p_sy, 255, 255, 255, true);
+                    prev_sx = p_sx;
+                    prev_sy = p_sy;
+                }
+            }
+            
+            // Only render unit sprite if on screen
             if sx > -50.0 && sx < WIDTH as f32 + 50.0 && sy > -50.0 && sy < HEIGHT as f32 + 50.0 {
                 let w = tile_size * 0.6;
-                
-                // Draw Unit Center (Offset by half width to center it on x,y)
                 let unit_draw_x = sx - w/2.0;
                 let unit_draw_y = sy - w/2.0;
 
                 if u.selected {
                     let box_size = tile_size * 1.2;
-                    // Center selection box on x,y
                     buffer.rect_outline((sx - box_size/2.0) as i32, (sy - box_size/2.0) as i32, box_size as i32, box_size as i32, 0, 255, 0);
-                    
-                    // Path
-                    if !u.path.is_empty() {
-                        let mut prev_sx = sx as i32;
-                        let mut prev_sy = sy as i32;
-                        
-                        for point in u.path.iter().rev() {
-                            let p_sx = ((point.0 - cam_x) * zoom + screen_center_x) as i32;
-                            let p_sy = ((point.1 - cam_y) * zoom + screen_center_y) as i32;
-                            
-                            buffer.line(prev_sx, prev_sy, p_sx, p_sy, 255, 255, 255, true);
-                            prev_sx = p_sx;
-                            prev_sy = p_sy;
-                        }
-                    }
                 }
                 
                 buffer.rect(unit_draw_x as i32, unit_draw_y as i32, w as i32, w as i32, u.color.0, u.color.1, u.color.2);
@@ -1654,13 +1891,56 @@ pub fn run_game() -> Result<(), JsValue> {
         } else {
             let any_unit_selected = gs.units.iter().any(|u| u.selected && Some(u.owner_id) == gs.my_id);
             if any_unit_selected {
-                 // Build Wall Button
-                 buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
-                 // Wall icon (small brick pattern)
-                 buffer.rect(15, (home_btn_y + 10.0) as i32, 12, 8, 150, 150, 150);
-                 buffer.rect(29, (home_btn_y + 10.0) as i32, 12, 8, 130, 130, 130);
-                 buffer.rect(15, (home_btn_y + 20.0) as i32, 12, 8, 130, 130, 130);
-                 buffer.rect(29, (home_btn_y + 20.0) as i32, 12, 8, 150, 150, 150);
+                 // Build Wall Button - changes color when build mode active
+                 let build_color = if gs.build_mode { (0, 200, 0) } else { (0, 0, 150) };
+                 buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, build_color.0, build_color.1, build_color.2);
+                 // Centered 2x2 brick icon (10x10 squares with 4px gap)
+                 let sq = 10; // square size
+                 let gap = 4;
+                 let grid_size = sq * 2 + gap; // 24
+                 let offset_x = 10 + ((btn_size as i32 - grid_size) / 2); // center horizontally
+                 let offset_y = home_btn_y as i32 + ((btn_size as i32 - grid_size) / 2); // center vertically
+                 buffer.rect(offset_x, offset_y, sq, sq, 150, 150, 150);
+                 buffer.rect(offset_x + sq + gap, offset_y, sq, sq, 130, 130, 130);
+                 buffer.rect(offset_x, offset_y + sq + gap, sq, sq, 130, 130, 130);
+                 buffer.rect(offset_x + sq + gap, offset_y + sq + gap, sq, sq, 150, 150, 150);
+            }
+        }
+        
+        // --- CONFIRM/CANCEL BUTTONS (when wall placement ready) ---
+        if gs.build_mode && gs.wall_end.is_some() {
+            // Confirm button (green) - right side
+            let confirm_btn_x = WIDTH as f32 - btn_size - 60.0;
+            let confirm_btn_y = home_btn_y;
+            buffer.rect(confirm_btn_x as i32, confirm_btn_y as i32, btn_size as i32, btn_size as i32, 0, 150, 0);
+            // Checkmark icon
+            buffer.rect((confirm_btn_x + 10.0) as i32, (confirm_btn_y + 20.0) as i32, 8, 4, 255, 255, 255);
+            buffer.rect((confirm_btn_x + 16.0) as i32, (confirm_btn_y + 10.0) as i32, 4, 18, 255, 255, 255);
+            
+            // Cancel button (red) - right of confirm
+            let cancel_btn_x = WIDTH as f32 - btn_size - 10.0;
+            let cancel_btn_y = home_btn_y;
+            buffer.rect(cancel_btn_x as i32, cancel_btn_y as i32, btn_size as i32, btn_size as i32, 150, 0, 0);
+            // X icon
+            buffer.rect((cancel_btn_x + 12.0) as i32, (cancel_btn_y + 10.0) as i32, 16, 4, 255, 255, 255);
+            buffer.rect((cancel_btn_x + 12.0) as i32, (cancel_btn_y + 26.0) as i32, 16, 4, 255, 255, 255);
+            buffer.rect((cancel_btn_x + 12.0) as i32, (cancel_btn_y + 10.0) as i32, 4, 20, 255, 255, 255);
+            buffer.rect((cancel_btn_x + 24.0) as i32, (cancel_btn_y + 10.0) as i32, 4, 20, 255, 255, 255);
+        }
+        
+        // --- BUILD MODE INDICATOR ---
+        if gs.build_mode {
+            // Show current state above footer
+            let msg_y = HEIGHT as f32 - footer_height - 25.0;
+            if gs.wall_start.is_none() {
+                // "Click to set start point" - just show a small green dot indicator
+                buffer.rect(10, msg_y as i32, 8, 8, 0, 255, 0);
+            } else if gs.wall_end.is_none() {
+                // "Click to set end point" - show start + yellow indicator
+                buffer.rect(10, msg_y as i32, 8, 8, 255, 255, 0);
+            } else {
+                // "Confirm or Cancel" - show blue indicator
+                buffer.rect(10, msg_y as i32, 8, 8, 50, 150, 255);
             }
         }
         
@@ -1691,17 +1971,16 @@ pub fn run_game() -> Result<(), JsValue> {
             }
         }
         
-        // Draw Selection Outline for Building
+        // Draw Selection Outline for Building (TOP-LEFT based like tiles)
         if let Some(b_idx) = gs.selected_building {
             if b_idx < gs.buildings.len() {
                 let b = &gs.buildings[b_idx];
-                let bx = b.tile_x as f32 * TILE_SIZE_BASE;
-                let by = b.tile_y as f32 * TILE_SIZE_BASE;
-                let sx = (bx - cam_x) * zoom + screen_center_x;
-                let sy = (by - cam_y) * zoom + screen_center_y;
-                let size = tile_size * 1.5;
-                let box_size = size * 1.2;
-                buffer.rect_outline((sx - box_size/2.0) as i32, (sy - box_size/2.0) as i32, box_size as i32, box_size as i32, 0, 255, 0);
+                let tile_world_x = b.tile_x as f32 * TILE_SIZE_BASE;
+                let tile_world_y = b.tile_y as f32 * TILE_SIZE_BASE;
+                let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
+                let sy = (tile_world_y - cam_y) * zoom + screen_center_y;
+                // Green outline around the tile
+                buffer.rect_outline(sx as i32 - 2, sy as i32 - 2, tile_size.ceil() as i32 + 4, tile_size.ceil() as i32 + 4, 0, 255, 0);
             }
         }
 

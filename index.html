@@ -2,8 +2,13 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rust + Wasm Chat</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <!-- Mobile web app meta tags -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#222222">
+    <title>Temty</title>
     
     <!-- Farcaster MiniApp Meta Tags -->
     <meta name="fc:miniapp" content='{"version":"1","imageUrl":"https://temty.vercel.app/logo.png","button":{"title":"Play Temty","action":{"type":"launch_frame","name":"Temty","url":"https://temty.vercel.app/","splashImageUrl":"https://temty.vercel.app/logo.png","splashBackgroundColor":"#222222"}}}' />
@@ -11,16 +16,34 @@
     
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
-        body { 
+        /* Mobile browser safe area support */
+        :root {
+            --sat: env(safe-area-inset-top, 0px);
+            --sar: env(safe-area-inset-right, 0px);
+            --sab: env(safe-area-inset-bottom, 0px);
+            --sal: env(safe-area-inset-left, 0px);
+        }
+        
+        html, body { 
             margin: 0; 
+            padding: 0;
             font-family: sans-serif; 
             background-color: #222;
             color: #eee;
-            overflow: hidden; /* Prevent scrolling */
+            overflow: hidden;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            height: 100%;
+            width: 100%;
             display: flex;
             justify-content: center;
-            align-items: center;
-            height: 100vh;
+            /* TOP ALIGN - so browser footer cuts bottom of canvas, not our UI */
+            align-items: flex-start;
+            padding-top: var(--sat);
+            box-sizing: border-box;
         }
         
         /* The Main Game Canvas */
@@ -28,6 +51,17 @@
             background-color: #000;
             box-shadow: 0 0 20px rgba(0,0,0,0.5);
             border: 1px solid #444;
+            /* Prevent browser gestures on canvas */
+            touch-action: none;
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+        
+        /* Prevent pull-to-refresh and overscroll */
+        body {
+            overscroll-behavior: none;
+            -webkit-overflow-scrolling: touch;
         }
 
         /* Chat Container - Keeping this as HTML overlay for now as requested in previous steps, 
