@@ -255,6 +255,10 @@ struct GameState {
     drag_start: Option<(f32, f32)>,  // Screen coords
     drag_current: Option<(f32, f32)>, // Screen coords
     
+    // Mouse/touch down tracking (to distinguish click from drag/pan)
+    mouse_down_pos: Option<(f32, f32)>,
+    touch_is_pan_or_zoom: bool,  // Set true if user panned or pinch-zoomed
+    
     // Build Mode (wall placement)
     build_mode: bool,
     wall_start: Option<(i32, i32)>,  // Tile coords - first point
@@ -292,6 +296,8 @@ impl GameState {
             group_select_mode: false,
             drag_start: None,
             drag_current: None,
+            mouse_down_pos: None,
+            touch_is_pan_or_zoom: false,
             build_mode: false,
             wall_start: None,
             wall_end: None,
@@ -1477,14 +1483,15 @@ pub fn run_game() -> Result<(), JsValue> {
             
             gs.end_touch();
             
-            // Always allow footer clicks (for button toggles)
-            let footer_height = 60.0;
-            if y > HEIGHT as f32 - footer_height {
-                gs.handle_click(x, y);
-            } else if gs.group_select_mode {
-                gs.handle_drag_start(x, y);
-            } else {
-                gs.handle_click(x, y);
+            // Store mouse down position for click vs drag detection
+            gs.mouse_down_pos = Some((x, y));
+            
+            // Start group selection drag if in that mode
+            if gs.group_select_mode {
+                let footer_height = 60.0;
+                if y <= HEIGHT as f32 - footer_height {
+                    gs.handle_drag_start(x, y);
+                }
             }
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())?;
@@ -1492,9 +1499,30 @@ pub fn run_game() -> Result<(), JsValue> {
     }
     {
         let gs = game_state.clone();
-        let closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        let closure = Closure::wrap(Box::new(move |event: MouseEvent| {
             let mut gs = gs.borrow_mut();
+            let x = event.offset_x() as f32;
+            let y = event.offset_y() as f32;
+            
+            // Check if this was a click (minimal movement) vs a drag/pan
+            let was_click = if let Some((start_x, start_y)) = gs.mouse_down_pos {
+                let dist = ((x - start_x).powi(2) + (y - start_y).powi(2)).sqrt();
+                dist < 15.0  // Must move less than 15 pixels to count as click
+            } else {
+                false
+            };
+            
+            // Handle drag end first (for group selection)
             gs.handle_drag_end();
+            
+            // Only trigger click if it was actually a click, not a pan
+            if was_click {
+                if let Some((start_x, start_y)) = gs.mouse_down_pos {
+                    gs.handle_click(start_x, start_y);
+                }
+            }
+            
+            gs.mouse_down_pos = None;
             gs.end_touch();
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())?;
@@ -1504,6 +1532,7 @@ pub fn run_game() -> Result<(), JsValue> {
         let gs = game_state.clone();
         let closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
             let mut gs = gs.borrow_mut();
+            gs.mouse_down_pos = None;
             gs.handle_drag_end();
             gs.end_touch();
         }) as Box<dyn FnMut(_)>);
@@ -1528,6 +1557,8 @@ pub fn run_game() -> Result<(), JsValue> {
         let canvas_clone = canvas.clone();
         let closure = Closure::wrap(Box::new(move |event: TouchEvent| {
             let touches = event.touches();
+            let mut gs = gs.borrow_mut();
+            
             if touches.length() == 1 {
                 event.prevent_default();
                 let t = touches.get(0).unwrap();
@@ -1535,15 +1566,20 @@ pub fn run_game() -> Result<(), JsValue> {
                 let x = t.client_x() as f32 - rect.left() as f32;
                 let y = t.client_y() as f32 - rect.top() as f32;
                 
-                let mut gs = gs.borrow_mut();
+                // Store touch start position for tap detection
+                gs.mouse_down_pos = Some((x, y));
+                gs.touch_is_pan_or_zoom = false;
+                
                 // Only start drag if not in footer (footer needs button clicks)
                 let footer_height = 60.0;
                 if gs.group_select_mode && y <= HEIGHT as f32 - footer_height {
                     gs.handle_drag_start(x, y);
                 }
-                // Store for later tap detection
                 gs.last_pan_x = Some(x);
                 gs.last_pan_y = Some(y);
+            } else if touches.length() >= 2 {
+                // Multi-touch = pinch zoom, not a tap
+                gs.touch_is_pan_or_zoom = true;
             }
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("touchstart", closure.as_ref().unchecked_ref())?;
@@ -1555,8 +1591,13 @@ pub fn run_game() -> Result<(), JsValue> {
         let canvas_clone = canvas.clone();
         let closure = Closure::wrap(Box::new(move |event: TouchEvent| {
             let touches = event.touches();
+            let mut gs = gs.borrow_mut();
+            
             if touches.length() == 2 {
-                event.prevent_default(); 
+                event.prevent_default();
+                // Mark as zoom gesture - don't click on release
+                gs.touch_is_pan_or_zoom = true;
+                
                 let t1 = touches.get(0).unwrap();
                 let t2 = touches.get(1).unwrap();
                 
@@ -1567,7 +1608,7 @@ pub fn run_game() -> Result<(), JsValue> {
                 let cx = (t1.client_x() + t2.client_x()) as f32 / 2.0;
                 let cy = (t1.client_y() + t2.client_y()) as f32 / 2.0;
                 
-                gs.borrow_mut().handle_touch_zoom(dist, cx, cy);
+                gs.handle_touch_zoom(dist, cx, cy);
             } else if touches.length() == 1 {
                 event.prevent_default();
                 let t = touches.get(0).unwrap();
@@ -1575,7 +1616,14 @@ pub fn run_game() -> Result<(), JsValue> {
                 let x = t.client_x() as f32 - rect.left() as f32;
                 let y = t.client_y() as f32 - rect.top() as f32;
                 
-                let mut gs = gs.borrow_mut();
+                // Check if we moved enough to be a pan (not a tap)
+                if let Some((start_x, start_y)) = gs.mouse_down_pos {
+                    let dist = ((x - start_x).powi(2) + (y - start_y).powi(2)).sqrt();
+                    if dist > 15.0 {
+                        gs.touch_is_pan_or_zoom = true;
+                    }
+                }
+                
                 if gs.group_select_mode && gs.drag_start.is_some() {
                     gs.handle_drag_move(x, y);
                 } else {
@@ -1589,30 +1637,24 @@ pub fn run_game() -> Result<(), JsValue> {
     // touchend
     {
         let gs = game_state.clone();
-        let canvas_clone = canvas.clone();
-        let closure = Closure::wrap(Box::new(move |event: TouchEvent| {
+        let closure = Closure::wrap(Box::new(move |_event: TouchEvent| {
             let mut gs = gs.borrow_mut();
             
-            // Check if this was a tap (minimal movement)
-            if let (Some(start_x), Some(start_y)) = (gs.last_pan_x, gs.last_pan_y) {
-                let changed = event.changed_touches();
-                if changed.length() == 1 {
-                    let t = changed.get(0).unwrap();
-                    let rect = canvas_clone.get_bounding_client_rect();
-                    let x = t.client_x() as f32 - rect.left() as f32;
-                    let y = t.client_y() as f32 - rect.top() as f32;
-                    
-                    let move_dist = ((x - start_x).powi(2) + (y - start_y).powi(2)).sqrt();
-                    
-                    if gs.group_select_mode && gs.drag_start.is_some() {
-                        gs.handle_drag_end();
-                    } else if move_dist < 15.0 {
-                        // This was a tap, treat as click
-                        gs.handle_click(start_x, start_y);
-                    }
+            // Handle group selection drag end
+            if gs.group_select_mode && gs.drag_start.is_some() {
+                gs.handle_drag_end();
+            }
+            
+            // Only click if this was a tap (not a pan or pinch zoom)
+            if !gs.touch_is_pan_or_zoom {
+                if let Some((start_x, start_y)) = gs.mouse_down_pos {
+                    gs.handle_click(start_x, start_y);
                 }
             }
             
+            // Reset state
+            gs.mouse_down_pos = None;
+            gs.touch_is_pan_or_zoom = false;
             gs.end_touch();
         }) as Box<dyn FnMut(_)>);
         canvas.add_event_listener_with_callback("touchend", closure.as_ref().unchecked_ref())?;
