@@ -140,6 +140,18 @@ fn cost_for_kind(kind: u8) -> Resources {
     }
 }
 
+fn hp_for_kind(kind: u8) -> f32 {
+    match kind {
+        0 => TOWN_HP,
+        1 => WALL_HP,
+        2 => FARM_HP,
+        3 => HOUSE_HP,
+        4 => TOWER_HP,
+        5 => BARRACKS_HP,
+        _ => 200.0,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BuildTask {
     owner_id: i32,
@@ -594,15 +606,7 @@ async fn main() {
                             kind: task.kind,
                             tile_x: task.tile_x,
                             tile_y: task.tile_y,
-                            hp: match task.kind {
-                                0 => TOWN_HP,
-                                1 => WALL_HP,
-                                2 => FARM_HP,
-                                3 => HOUSE_HP,
-                                4 => TOWER_HP,
-                                5 => BARRACKS_HP,
-                                _ => 200.0,
-                            },
+                            hp: hp_for_kind(task.kind),
                         }
                     };
                     if let Ok(json) = serde_json::to_string(&msg) {
@@ -617,15 +621,7 @@ async fn main() {
                                 kind: task.kind,
                                 tile_x: task.tile_x,
                                 tile_y: task.tile_y,
-                                hp: match task.kind {
-                                    0 => TOWN_HP,
-                                    1 => WALL_HP,
-                                    2 => FARM_HP,
-                                    3 => HOUSE_HP,
-                                    4 => TOWER_HP,
-                                    5 => BARRACKS_HP,
-                                    _ => 200.0,
-                                },
+                                hp: hp_for_kind(task.kind),
                             });
                 }
 
@@ -995,7 +991,7 @@ async fn handle_connection(
              kind: r.get::<i32, _>("kind") as u8,
              tile_x: r.get("tile_x"),
              tile_y: r.get("tile_y"),
-             hp: 200.0,
+             hp: hp_for_kind(r.get::<i32, _>("kind") as u8),
          }).collect();
 
          (Some(players), Some(units), Some(buildings))
@@ -1070,7 +1066,13 @@ async fn handle_connection(
         }
         
         if let (Some(ps), Some(us), Some(bs)) = (db_players, db_units, db_buildings) {
-            (ps, us, bs)
+            // Prefer in-memory buildings if available (preserves damage state)
+            let final_buildings = if gs.buildings.is_empty() {
+                bs
+            } else {
+                gs.buildings.clone()
+            };
+            (ps, us, final_buildings)
         } else {
         let existing_players: Vec<PlayerInfo> = gs.players.values().cloned().collect();
         

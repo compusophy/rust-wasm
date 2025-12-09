@@ -211,16 +211,9 @@ enum GatherKind {
 }
 
 #[derive(Clone, Copy)]
-struct GatherJob {
-    kind: GatherKind,
-    target: (i32, i32), // tile target (for farm, the farm tile)
-}
-
-#[derive(Clone, Copy)]
 enum UnitJob {
     Idle,
-    Gathering(GatherJob),
-    Building(u32), // build project id
+    Gathering,
 }
 
 struct PixelBuffer {
@@ -330,7 +323,6 @@ impl PartialOrd for Node {
 #[derive(Clone, Copy, PartialEq)]
 enum TileType {
     Grass,
-    Water,
     Forest,
     Mountain,
     Gold,
@@ -559,7 +551,7 @@ impl GameState {
 
         match self.get_tile_type(gx, gy) {
             Some(t) => match t {
-                TileType::Water | TileType::Forest | TileType::Mountain | TileType::Gold => return false,
+                TileType::Forest | TileType::Mountain | TileType::Gold => return false,
                 _ => {}
             },
             None => return false, // Should be covered by chunk check above
@@ -870,8 +862,50 @@ impl GameState {
         let footer_height = 60.0;
         let unit_icon_size = 20.0;
         let icons_y = HEIGHT as f32 - footer_height - unit_icon_size - 5.0;
+        let btn_size = 40.0;
+        let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - btn_size) / 2.0;
+        let build_btn_x = 10.0;
+        let build_btn_y = home_btn_y;
+
+        // 0. Check Build Menu Options (Floating above footer)
+        if self.build_menu_open {
+            let options = [
+                BuildKind::Wall,
+                BuildKind::Farm,
+                BuildKind::House,
+                BuildKind::Tower,
+                BuildKind::Barracks,
+            ];
+            for (idx, kind) in options.iter().enumerate() {
+                let opt_y = build_btn_y - ((idx as f32 + 1.0) * (btn_size + 6.0));
+                if screen_x >= build_btn_x && screen_x <= build_btn_x + btn_size &&
+                   screen_y >= opt_y && screen_y <= opt_y + btn_size {
+                    if *kind == BuildKind::Wall {
+                        self.selected_build = Some(BuildKind::Wall);
+                        self.build_mode = true;
+                        self.wall_start = None;
+                        self.wall_end = None;
+                        self.wall_preview.clear();
+                        self.build_menu_open = false; // Close for walls as it changes footer mode
+                    } else {
+                        // Toggle or Select
+                        if self.selected_build == Some(*kind) {
+                            self.selected_build = None;
+                        } else {
+                            self.selected_build = Some(*kind);
+                        }
+                        self.build_mode = false;
+                        self.wall_start = None;
+                        self.wall_end = None;
+                        self.wall_preview.clear();
+                        // self.build_menu_open = false; // KEEP OPEN
+                    }
+                    return;
+                }
+            }
+        }
         
-        // Check Selected Unit Icons (above footer) - click to deselect
+        // Check Selected Unit Icons (above footer, RIGHT SIDE) - click to deselect
         if screen_y >= icons_y && screen_y <= icons_y + unit_icon_size {
             // Get selected units with their indices
             let selected_indices: Vec<usize> = self.units.iter()
@@ -882,7 +916,7 @@ impl GameState {
             
             let max_display = 10;
             for (i, &unit_idx) in selected_indices.iter().take(max_display).enumerate() {
-                let icon_x = 10.0 + (i as f32 * (unit_icon_size + 4.0));
+                let icon_x = WIDTH as f32 - 10.0 - unit_icon_size - (i as f32 * (unit_icon_size + 4.0));
                 if screen_x >= icon_x && screen_x <= icon_x + unit_icon_size {
                     // Deselect this unit
                     self.units[unit_idx].selected = false;
@@ -895,7 +929,6 @@ impl GameState {
             // Click is in Footer
             
             // 1. Check Home Button (Center)
-            let btn_size = 40.0;
             let home_btn_x = (WIDTH as f32 - btn_size) / 2.0;
             let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - btn_size) / 2.0;
             
@@ -917,6 +950,28 @@ impl GameState {
                        }
                    }
                    return;
+            }
+            
+            // Check Deselect All Button (Left of Home)
+            // Only visible if something is selected
+            let any_unit_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
+            if any_unit_selected || self.selected_building.is_some() || self.selected_build.is_some() {
+                let deselect_btn_x = home_btn_x - btn_size - 10.0;
+                let deselect_btn_y = home_btn_y;
+                
+                if screen_x >= deselect_btn_x && screen_x <= deselect_btn_x + btn_size &&
+                   screen_y >= deselect_btn_y && screen_y <= deselect_btn_y + btn_size {
+                    // Deselect All
+                    for u in &mut self.units { u.selected = false; }
+                    self.selected_building = None;
+                    self.selected_build = None;
+                    self.build_mode = false;
+                    self.wall_start = None;
+                    self.wall_end = None;
+                    self.wall_preview.clear();
+                    self.build_menu_open = false;
+                    return;
+                }
             }
             
             // 2. Check Group Select Button (Right of Home)
@@ -988,37 +1043,7 @@ impl GameState {
                         return;
                     }
 
-                    // Build submenu options (vertical list above build button)
-                    if self.build_menu_open {
-                        let options = [
-                            BuildKind::Wall,
-                            BuildKind::Farm,
-                            BuildKind::House,
-                            BuildKind::Tower,
-                            BuildKind::Barracks,
-                        ];
-                        for (idx, kind) in options.iter().enumerate() {
-                            let opt_y = build_btn_y - ((idx as f32 + 1.0) * (btn_size + 6.0));
-                            if screen_x >= build_btn_x && screen_x <= build_btn_x + btn_size &&
-                               screen_y >= opt_y && screen_y <= opt_y + btn_size {
-                                if *kind == BuildKind::Wall {
-                                    self.selected_build = Some(BuildKind::Wall);
-                                    self.build_mode = true;
-                                    self.wall_start = None;
-                                    self.wall_end = None;
-                                    self.wall_preview.clear();
-                                } else {
-                                    self.selected_build = Some(*kind);
-                                    self.build_mode = false;
-                                    self.wall_start = None;
-                                    self.wall_end = None;
-                                    self.wall_preview.clear();
-                                }
-                                self.build_menu_open = false;
-                                return;
-                            }
-                        }
-                    }
+                    // Build submenu options handled above (outside footer check)
                 }
             }
             
@@ -1354,12 +1379,6 @@ impl GameState {
     fn can_afford(&self, cost: &Resources) -> bool {
         self.resources.has(cost)
     }
-
-    fn recompute_pop(&mut self) {
-        if let Some(my_id) = self.my_id {
-            self.pop_used = self.units.iter().filter(|u| u.owner_id == my_id).count() as i32;
-        }
-    }
     
     fn confirm_wall_build(&mut self) {
         if self.wall_preview.is_empty() {
@@ -1390,24 +1409,6 @@ impl GameState {
         // Keep build_mode on so user can try again
     }
 
-    fn spawn_local_unit(&mut self, pos: (f32, f32), kind: UnitKind) {
-        if let Some(my_id) = self.my_id {
-            let color = (0, 0, 255);
-            self.units.push(Unit {
-                x: pos.0,
-                y: pos.1,
-                path: Vec::new(),
-                selected: false,
-                kind: kind.to_u8(),
-                color,
-                owner_id: my_id,
-                job: UnitJob::Idle,
-                hp: if kind == UnitKind::Warrior { WARRIOR_HP } else { WORKER_HP },
-            });
-            self.pop_used += 1;
-        }
-    }
-
     fn find_adjacent_walkable(&self, tx: i32, ty: i32) -> Option<(f32, f32)> {
         let dirs = [(1,0), (-1,0), (0,1), (0,-1)];
         for (dx, dy) in dirs {
@@ -1435,7 +1436,7 @@ impl GameState {
             for (idx, x, y) in selected {
                 let path = self.find_path((x, y), adj);
                 if let Some(u) = self.units.get_mut(idx) {
-                    u.job = UnitJob::Gathering(GatherJob { kind, target: target_tile });
+                    u.job = UnitJob::Gathering;
                     if !path.is_empty() { u.path = path; }
                 }
                 let mut my_idx = 0;
@@ -2202,7 +2203,6 @@ pub fn run_game() -> Result<(), JsValue> {
                             let idx = (y * CHUNK_SIZE + x) as usize;
                             let color = match chunk.tiles[idx] {
                                 TileType::Grass => (75, 105, 47),
-                                TileType::Water => (50, 89, 165),
                                 TileType::Forest => (34, 139, 34),
                                 TileType::Mountain => (128, 128, 128),
                                 TileType::Gold => (255, 215, 0),
@@ -2288,6 +2288,7 @@ pub fn run_game() -> Result<(), JsValue> {
             }
 
             // Health bar for buildings
+            // Only draw health bar if building is selected OR if it's damaged (< 100%)
             let max_hp = match b.kind {
                 0 => TOWN_HP,
                 1 => WALL_HP,
@@ -2297,11 +2298,22 @@ pub fn run_game() -> Result<(), JsValue> {
                 5 => BARRACKS_HP,
                 _ => 200.0,
             };
-            let hp_ratio = (b.hp / max_hp).clamp(0.0, 1.0);
-            let bar_w = tile_size;
-            let filled = (bar_w * hp_ratio) as i32;
-            buffer.rect(sx as i32, (sy - 6.0) as i32, bar_w as i32, 4, 60, 20, 20);
-            buffer.rect(sx as i32, (sy - 6.0) as i32, filled, 4, 0, 200, 0);
+            
+            // Check if selected
+            let is_selected = gs.selected_building.map_or(false, |sel_idx| {
+                if sel_idx < gs.buildings.len() {
+                    let sb = &gs.buildings[sel_idx];
+                    sb.tile_x == b.tile_x && sb.tile_y == b.tile_y
+                } else { false }
+            });
+
+            if is_selected {
+                let hp_ratio = (b.hp / max_hp).clamp(0.0, 1.0);
+                let bar_w = tile_size;
+                let filled = (bar_w * hp_ratio) as i32;
+                buffer.rect(sx as i32, (sy - 6.0) as i32, bar_w as i32, 4, 60, 20, 20);
+                buffer.rect(sx as i32, (sy - 6.0) as i32, filled, 4, 0, 200, 0);
+            }
         }
         
         // --- WALL PREVIEW (transparent blue) ---
@@ -2406,12 +2418,14 @@ pub fn run_game() -> Result<(), JsValue> {
                 }
                 buffer.rect(unit_draw_x as i32, unit_draw_y as i32, w as i32, w as i32, draw_color.0, draw_color.1, draw_color.2);
 
-                // Health bar
-                let hp_ratio = (u.hp / if u.kind == UnitKind::Warrior.to_u8() { WARRIOR_HP } else { WORKER_HP }).clamp(0.0, 1.0);
-                let bar_w = w;
-                let filled = (bar_w * hp_ratio) as i32;
-                buffer.rect((unit_draw_x) as i32, (unit_draw_y - 4.0) as i32, bar_w as i32, 3, 60, 20, 20);
-                buffer.rect((unit_draw_x) as i32, (unit_draw_y - 4.0) as i32, filled, 3, 0, 200, 0);
+                // Health bar (Only if selected)
+                if u.selected {
+                    let hp_ratio = (u.hp / if u.kind == UnitKind::Warrior.to_u8() { WARRIOR_HP } else { WORKER_HP }).clamp(0.0, 1.0);
+                    let bar_w = w;
+                    let filled = (bar_w * hp_ratio) as i32;
+                    buffer.rect((unit_draw_x) as i32, (unit_draw_y - 4.0) as i32, bar_w as i32, 3, 60, 20, 20);
+                    buffer.rect((unit_draw_x) as i32, (unit_draw_y - 4.0) as i32, filled, 3, 0, 200, 0);
+                }
             }
         }
 
@@ -2477,6 +2491,26 @@ pub fn run_game() -> Result<(), JsValue> {
         buffer.rect(home_btn_x as i32, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
         buffer.rect((home_btn_x + 13.0) as i32, (home_btn_y + 13.0) as i32, 14, 14, 255, 255, 255);
         
+        // Deselect All Button (Left of Home)
+        let any_unit_selected = gs.units.iter().any(|u| u.selected && Some(u.owner_id) == gs.my_id);
+        if any_unit_selected || gs.selected_building.is_some() || gs.selected_build.is_some() {
+            let deselect_btn_x = home_btn_x - btn_size - 10.0;
+            let deselect_btn_y = home_btn_y;
+            
+            buffer.rect(deselect_btn_x as i32, deselect_btn_y as i32, btn_size as i32, btn_size as i32, 80, 80, 80);
+            
+            // Thin X
+            let center_x = deselect_btn_x + btn_size / 2.0;
+            let center_y = deselect_btn_y + btn_size / 2.0;
+            let arm_len = 10.0;
+            
+            // Draw X lines manually
+            // Top-left to Bottom-right
+            buffer.line((center_x - arm_len/2.0) as i32, (center_y - arm_len/2.0) as i32, (center_x + arm_len/2.0) as i32, (center_y + arm_len/2.0) as i32, 200, 200, 200, false);
+            // Top-right to Bottom-left
+            buffer.line((center_x + arm_len/2.0) as i32, (center_y - arm_len/2.0) as i32, (center_x - arm_len/2.0) as i32, (center_y + arm_len/2.0) as i32, 200, 200, 200, false);
+        }
+        
         // Group Select Button (Right of Home) - Simple box outline icon
         let group_btn_x = home_btn_x + btn_size + 10.0;
         let group_btn_y = home_btn_y;
@@ -2514,17 +2548,32 @@ pub fn run_game() -> Result<(), JsValue> {
 
                  if gs.build_menu_open {
                      let options = [
-                         (BuildKind::Wall, (150, 150, 150)),
-                         (BuildKind::Farm, (50, 120, 50)),
-                         (BuildKind::House, (200, 180, 120)),
-                         (BuildKind::Tower, (120, 120, 140)),
-                         (BuildKind::Barracks, (180, 80, 80)),
+                         (BuildKind::Wall, (150u8, 150u8, 150u8)),
+                         (BuildKind::Farm, (50u8, 120u8, 50u8)),
+                         (BuildKind::House, (200u8, 180u8, 120u8)),
+                         (BuildKind::Tower, (120u8, 120u8, 140u8)),
+                         (BuildKind::Barracks, (180u8, 80u8, 80u8)),
                      ];
                      for (idx, (kind, color)) in options.iter().enumerate() {
                          let opt_y = home_btn_y - ((idx as f32 + 1.0) * (btn_size + 6.0));
                          let affordable = gs.resources.has(&kind.cost());
-                         let draw_color = if affordable { *color } else { (color.0 / 2, color.1 / 2, color.2 / 2) };
+                         
+                         // Highlight selected build type
+                         let is_active = gs.selected_build == Some(*kind) || (gs.build_mode && *kind == BuildKind::Wall);
+                         
+                         let mut draw_color = if affordable { *color } else { (color.0 / 2, color.1 / 2, color.2 / 2) };
+                         
+                         if is_active {
+                             // Make it brighter or add border indicator
+                             draw_color = (draw_color.0.saturating_add(50), draw_color.1.saturating_add(50), draw_color.2.saturating_add(50));
+                         }
+
                          buffer.rect(10, opt_y as i32, btn_size as i32, btn_size as i32, draw_color.0, draw_color.1, draw_color.2);
+                         
+                         if is_active {
+                             buffer.rect_outline(10, opt_y as i32, btn_size as i32, btn_size as i32, 255, 255, 255);
+                         }
+                         
                          // Tiny icon per type
                          match kind {
                              BuildKind::Wall => {
@@ -2592,7 +2641,7 @@ pub fn run_game() -> Result<(), JsValue> {
             }
         }
         
-        // --- SELECTED UNITS DISPLAY (Above footer, left side) ---
+        // --- SELECTED UNITS DISPLAY (Above footer, RIGHT SIDE) ---
         let selected_units: Vec<_> = gs.units.iter().filter(|u| u.selected && Some(u.owner_id) == gs.my_id).collect();
         if !selected_units.is_empty() {
             let unit_icon_size = 20.0;
@@ -2600,7 +2649,7 @@ pub fn run_game() -> Result<(), JsValue> {
             let max_display = 10; // Max icons to show
             
             for (i, u) in selected_units.iter().take(max_display).enumerate() {
-                let icon_x = 10.0 + (i as f32 * (unit_icon_size + 4.0));
+                let icon_x = WIDTH as f32 - 10.0 - unit_icon_size - (i as f32 * (unit_icon_size + 4.0));
                 // Draw unit color square
                 buffer.rect(icon_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, u.color.0, u.color.1, u.color.2);
                 // Border
@@ -2610,7 +2659,7 @@ pub fn run_game() -> Result<(), JsValue> {
             // If more than max, show "+N"
             if selected_units.len() > max_display {
                 let _extra = selected_units.len() - max_display;
-                let text_x = 10.0 + (max_display as f32 * (unit_icon_size + 4.0));
+                let text_x = WIDTH as f32 - 10.0 - unit_icon_size - (max_display as f32 * (unit_icon_size + 4.0));
                 // Simple "+N" indicator (just a small box with different color)
                 buffer.rect(text_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, 100, 100, 100);
                 // Plus sign to indicate "more"
