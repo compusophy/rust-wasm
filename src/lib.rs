@@ -66,6 +66,8 @@ enum GameMessage {
     UnitHp { owner_id: i32, unit_idx: usize, hp: f32 },
     BuildingHp { tile_x: i32, tile_y: i32, hp: f32 },
     ResourceUpdate { player_id: i32, resources: Resources, pop_cap: i32, pop_used: i32 },
+    DeleteUnit { unit_idx: usize },
+    DeleteBuilding { tile_x: i32, tile_y: i32 },
     Error { message: String },
 }
 
@@ -347,6 +349,7 @@ struct Building {
     kind: u8,
     owner_id: i32, // Added owner tracking for coloring
     hp: f32,
+    selected: bool,
 }
 
 struct Chunk {
@@ -382,9 +385,6 @@ struct GameState {
     last_touch_dist: Option<f32>,
     last_pan_x: Option<f32>,
     last_pan_y: Option<f32>,
-    
-    // Selection
-    selected_building: Option<usize>,
     
     // Double-click detection
     last_click_time: f64,
@@ -438,7 +438,6 @@ impl GameState {
             last_touch_dist: None,
             last_pan_x: None,
             last_pan_y: None,
-            selected_building: None,
             last_click_time: 0.0,
             last_click_x: 0.0,
             last_click_y: 0.0,
@@ -491,6 +490,7 @@ impl GameState {
             kind: 0,
             owner_id: pid,
             hp: TOWN_HP,
+            selected: false,
         });
     }
 
@@ -860,8 +860,6 @@ impl GameState {
         
         // --- UI CLICK HANDLING ---
         let footer_height = 60.0;
-        let unit_icon_size = 20.0;
-        let icons_y = HEIGHT as f32 - footer_height - unit_icon_size - 5.0;
         let btn_size = 40.0;
         let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - btn_size) / 2.0;
         let build_btn_x = 10.0;
@@ -905,21 +903,58 @@ impl GameState {
             }
         }
         
-        // Check Selected Unit Icons (above footer, RIGHT SIDE) - click to deselect
+        // Check Selected Unit/Building Icons (above footer, CENTERED) - click to deselect
+        let footer_height = 60.0;
+        let unit_icon_size = 20.0;
+        let gap = 4.0;
+        let icons_y = HEIGHT as f32 - footer_height - unit_icon_size - 5.0;
+        
         if screen_y >= icons_y && screen_y <= icons_y + unit_icon_size {
-            // Get selected units with their indices
-            let selected_indices: Vec<usize> = self.units.iter()
-                .enumerate()
+            // Get selected units/buildings
+            // Note: We need to iterate carefully to match drawing order: Units then Buildings
+            
+            // 1. Collect indices of selected units
+            let unit_indices: Vec<usize> = self.units.iter().enumerate()
                 .filter(|(_, u)| u.selected && u.owner_id == my_id)
                 .map(|(i, _)| i)
                 .collect();
-            
+                
+            // 2. Collect indices of selected buildings
+            let building_indices: Vec<usize> = self.buildings.iter().enumerate()
+                .filter(|(_, b)| b.selected && b.owner_id == my_id)
+                .map(|(i, _)| i)
+                .collect();
+                
+            let total_selected = unit_indices.len() + building_indices.len();
             let max_display = 10;
-            for (i, &unit_idx) in selected_indices.iter().take(max_display).enumerate() {
-                let icon_x = WIDTH as f32 - 10.0 - unit_icon_size - (i as f32 * (unit_icon_size + 4.0));
-                if screen_x >= icon_x && screen_x <= icon_x + unit_icon_size {
-                    // Deselect this unit
-                    self.units[unit_idx].selected = false;
+            let count = total_selected.min(max_display);
+            let has_overflow = total_selected > max_display;
+            let total_items = count + if has_overflow { 1 } else { 0 };
+            
+            if total_items > 0 {
+                let total_width = (total_items as f32 * unit_icon_size) + ((total_items as f32 - 1.0).max(0.0) * gap);
+                let start_x = (WIDTH as f32 - total_width) / 2.0;
+                
+                // Check if clicked in this area
+                if screen_x >= start_x && screen_x <= start_x + total_width {
+                    // Find which index
+                    let click_idx = ((screen_x - start_x) / (unit_icon_size + gap)).floor() as usize;
+                    
+                    if click_idx < count {
+                        // Clicked an item
+                        if click_idx < unit_indices.len() {
+                            // Clicked a unit
+                            let u_idx = unit_indices[click_idx];
+                            self.units[u_idx].selected = false;
+                        } else {
+                            // Clicked a building
+                            let b_offset = click_idx - unit_indices.len();
+                            if b_offset < building_indices.len() {
+                                let b_idx = building_indices[b_offset];
+                                self.buildings[b_idx].selected = false;
+                            }
+                        }
+                    }
                     return;
                 }
             }
@@ -936,9 +971,10 @@ impl GameState {
                screen_y >= home_btn_y && screen_y <= home_btn_y + btn_size {
                    
                    // Select Town Center
-                   for (i, b) in self.buildings.iter().enumerate() {
+                   for b in &mut self.buildings {
                        if b.owner_id == my_id && b.kind == 0 {
-                           self.selected_building = Some(i);
+                           b.selected = true;
+                           // Deselect units (optional, but consistent with 'home' usually selecting just the TC)
                            for u in &mut self.units { u.selected = false; }
                            
                            let bx = b.tile_x as f32 * TILE_SIZE_BASE;
@@ -955,7 +991,8 @@ impl GameState {
             // Check Deselect All Button (Left of Home)
             // Only visible if something is selected
             let any_unit_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
-            if any_unit_selected || self.selected_building.is_some() || self.selected_build.is_some() {
+            let any_building_selected = self.buildings.iter().any(|b| b.selected && b.owner_id == my_id);
+            if any_unit_selected || any_building_selected || self.selected_build.is_some() {
                 let deselect_btn_x = home_btn_x - btn_size - 10.0;
                 let deselect_btn_y = home_btn_y;
                 
@@ -963,7 +1000,7 @@ impl GameState {
                    screen_y >= deselect_btn_y && screen_y <= deselect_btn_y + btn_size {
                     // Deselect All
                     for u in &mut self.units { u.selected = false; }
-                    self.selected_building = None;
+                    for b in &mut self.buildings { b.selected = false; }
                     self.selected_build = None;
                     self.build_mode = false;
                     self.wall_start = None;
@@ -984,9 +1021,12 @@ impl GameState {
                 return;
             }
 
-            // 3. Check Spawn Button (Left) - Only if building selected
-            if let Some(b_idx) = self.selected_building {
-                if b_idx < self.buildings.len() && self.buildings[b_idx].kind == 0 {
+            // 3. Check Spawn/Train Button (Left) - Only if one building selected
+            let selected_buildings: Vec<_> = self.buildings.iter().enumerate().filter(|(_, b)| b.selected && b.owner_id == my_id).collect();
+            
+            if selected_buildings.len() == 1 {
+                let (b_idx, b) = selected_buildings[0];
+                if b.kind == 0 {
                     let spawn_btn_x = 10.0;
                     let spawn_btn_y = home_btn_y;
                     
@@ -1003,7 +1043,7 @@ impl GameState {
                         }
                         return;
                     }
-                } else if b_idx < self.buildings.len() && self.buildings[b_idx].kind == BuildKind::Barracks.to_kind_id() {
+                } else if b.kind == BuildKind::Barracks.to_kind_id() {
                     let train_btn_x = 10.0;
                     let train_btn_y = home_btn_y;
                     if screen_x >= train_btn_x && screen_x <= train_btn_x + btn_size &&
@@ -1023,7 +1063,7 @@ impl GameState {
             }
             
             // 4. Check Build Wall Button (Left) - Only if unit selected AND no building selected
-            if self.selected_building.is_none() {
+            if selected_buildings.is_empty() {
                 let any_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
                 if any_selected {
                     let build_btn_x = 10.0;
@@ -1047,9 +1087,84 @@ impl GameState {
                 }
             }
             
-            // 5. Check Confirm/Cancel buttons (when wall placement is ready)
+            // 5. Check Delete Button (Right)
+            let selected_units: Vec<_> = self.units.iter().enumerate().filter(|(_, u)| u.selected && u.owner_id == my_id).collect();
+            let total_selected = selected_units.len() + selected_buildings.len();
+            
+            if total_selected == 1 && !self.build_mode {
+                 let mut show_delete = true;
+                 let mut entity_info = None; // (is_building, index)
+                 
+                 if let Some((idx, _)) = selected_units.first() {
+                     entity_info = Some((false, *idx));
+                 } else if let Some((idx, b)) = selected_buildings.first() {
+                     if b.kind == 0 { show_delete = false; }
+                     entity_info = Some((true, *idx));
+                 }
+                 
+                 if show_delete {
+                    let del_btn_x = WIDTH as f32 - btn_size - 10.0;
+                    let del_btn_y = home_btn_y;
+                    
+                    if screen_x >= del_btn_x && screen_x <= del_btn_x + btn_size &&
+                       screen_y >= del_btn_y && screen_y <= del_btn_y + btn_size {
+                        // Handle Delete
+                        if let Some((is_b, idx)) = entity_info {
+                            if let Some(ws) = &self.socket {
+                                let msg = if is_b {
+                                    let b = &self.buildings[idx];
+                                    GameMessage::DeleteBuilding { tile_x: b.tile_x, tile_y: b.tile_y }
+                                } else {
+                                    // Calculate player-local unit index
+                                    let mut my_idx = 0;
+                                    for (k, u) in self.units.iter().enumerate() {
+                                        if u.owner_id == my_id {
+                                            if k == idx { break; }
+                                            my_idx += 1;
+                                        }
+                                    }
+                                    GameMessage::DeleteUnit { unit_idx: my_idx }
+                                };
+                                
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    let _ = ws.send_with_str(&json);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                 }
+            }
+            
+            // 6. Check Confirm/Cancel buttons (when wall placement is ready)
             if self.build_mode && self.wall_end.is_some() {
-                // Confirm button (green check) - right side of footer
+                // Confirm button (green check) - right side of footer (shifted left to avoid delete button space?)
+                // Actually Delete button only appears if 1 unit selected.
+                // Confirm/Cancel appears if build mode active.
+                // Usually build mode active = units selected?
+                // Or maybe we can build without units selected if we allow it?
+                // Logic says "if any_selected -> show build button -> enter build mode".
+                // So units ARE selected.
+                // Delete button logic says "total_selected == 1".
+                // If I select 1 unit, enter build mode, I have 1 unit selected.
+                // So Delete button AND Confirm/Cancel buttons might overlap?
+                // Confirm/Cancel should take precedence or hide Delete.
+                // Let's hide Delete if build_mode is true?
+                // Or position them differently.
+                // Confirm is at WIDTH - 60 - 40.
+                // Cancel is at WIDTH - 10 - 40.
+                // Delete is at WIDTH - 10 - 40.
+                // They OVERLAP.
+                // If build_mode is on, we are placing walls. We shouldn't be deleting the unit.
+                // So the Confirm/Cancel check implies we are in a special mode.
+                // The Delete button check (block 5) happens before Block 6.
+                // If I click, Block 5 might catch it.
+                // I should verify `!self.build_mode` for Delete button?
+                // Or just put Block 6 before Block 5 and return?
+                // I'll put Block 6 check inside Block 5? No.
+                // I'll check `!self.build_mode` for delete button.
+                
+                // (Confirm/Cancel logic follows...)
                 let confirm_btn_x = WIDTH as f32 - btn_size - 60.0;
                 let confirm_btn_y = home_btn_y;
                 
@@ -1059,7 +1174,6 @@ impl GameState {
                     return;
                 }
                 
-                // Cancel button (red X) - right of confirm
                 let cancel_btn_x = WIDTH as f32 - btn_size - 10.0;
                 let cancel_btn_y = home_btn_y;
                 
@@ -1136,7 +1250,7 @@ impl GameState {
                 unit.selected = !unit.selected;
                 clicked_unit = true;
                 clicked_unit_kind = Some(unit.kind);
-                self.selected_building = None;
+                // self.selected_building = None; // Removed to allow mixed selection
                 break;
             }
         }
@@ -1155,7 +1269,9 @@ impl GameState {
         if !clicked_unit {
             // 2. Try Select Building
             let mut clicked_building = false;
-            for (i, b) in self.buildings.iter().enumerate() {
+            let mut farm_task = None;
+            
+            for (_i, b) in self.buildings.iter_mut().enumerate() {
                 if b.owner_id != my_id { continue; }
                 
                 // Buildings use TOP-LEFT based positioning (same as tiles)
@@ -1169,21 +1285,33 @@ impl GameState {
                        // If units are selected, allow assigning farm work
                        let any_unit_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
                        if any_unit_selected && b.kind == BuildKind::Farm.to_kind_id() {
-                           self.assign_gather(GatherKind::Farm, (b.tile_x, b.tile_y));
-                           return;
+                           farm_task = Some((b.tile_x, b.tile_y));
+                           break;
                        }
-                       self.selected_building = Some(i);
+                       // Toggle selection
+                       b.selected = !b.selected;
                        clicked_building = true;
-                       for u in &mut self.units { u.selected = false; }
+                       
+                       // If we just selected this building, deselect everything else? 
+                       // Current unit logic is toggle. Let's keep toggle for now to support "adding" to selection via clicking?
+                       // Actually, unit logic (line 1136) toggles.
+                       // But if I click a building, should I deselect units?
+                       // The previous code did: for u in &mut self.units { u.selected = false; }
+                       // I will REMOVE that to allow mixed selection as requested.
                        break;
                    }
+            }
+            
+            if let Some(target) = farm_task {
+                self.assign_gather(GatherKind::Farm, target);
+                return;
             }
             
             if !clicked_building {
                 let any_unit_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
                 
                 if !any_unit_selected {
-                    self.selected_building = None;
+                    for b in &mut self.buildings { b.selected = false; }
                 } else {
                     // Resource gathering on resource tiles
                     if let Some(tile_type) = self.get_tile_type(clicked_tile_x, clicked_tile_y) {
@@ -1293,7 +1421,21 @@ impl GameState {
                 }
             }
             
-            self.selected_building = None;
+            // Select all buildings in the rectangle
+            for b in &mut self.buildings {
+                if b.owner_id != my_id { continue; }
+                
+                // Building bounds
+                let bx = b.tile_x as f32 * TILE_SIZE_BASE;
+                let by = b.tile_y as f32 * TILE_SIZE_BASE;
+                // Check if building center is in selection, or any part? Center is easier.
+                let center_x = bx + TILE_SIZE_BASE / 2.0;
+                let center_y = by + TILE_SIZE_BASE / 2.0;
+                
+                if center_x >= min_x && center_x <= max_x && center_y >= min_y && center_y <= max_y {
+                    b.selected = !b.selected;
+                }
+            }
             
             // Auto-disable group select mode after selection is made
             self.group_select_mode = false;
@@ -1687,6 +1829,7 @@ pub fn run_game() -> Result<(), JsValue> {
                                     kind: 0,
                                     owner_id: p.id,
                                     hp: TOWN_HP,
+                                    selected: false,
                                 });
                             }
                             
@@ -1699,6 +1842,7 @@ pub fn run_game() -> Result<(), JsValue> {
                                     kind: b.kind,
                                     owner_id: b.owner_id,
                                     hp: b.hp,
+                                    selected: false,
                                 });
                             }
 
@@ -1860,6 +2004,7 @@ pub fn run_game() -> Result<(), JsValue> {
                             kind: building.kind,
                             owner_id: building.owner_id,
                             hp: building.hp,
+                            selected: false,
                         });
                             if Some(building.owner_id) == state.my_id && building.kind == BuildKind::House.to_kind_id() {
                                 state.pop_cap += 1;
@@ -1922,7 +2067,9 @@ pub fn run_game() -> Result<(), JsValue> {
                         GameMessage::BuildingDestroyed { tile_x, tile_y } => {
                             state.buildings.retain(|b| !(b.tile_x == tile_x && b.tile_y == tile_y));
                             state.server_progress.remove(&(tile_x, tile_y));
-                        }
+                        },
+                        GameMessage::DeleteUnit { .. } => {},
+                        GameMessage::DeleteBuilding { .. } => {}
                     }
                 }
             }
@@ -2300,12 +2447,7 @@ pub fn run_game() -> Result<(), JsValue> {
             };
             
             // Check if selected
-            let is_selected = gs.selected_building.map_or(false, |sel_idx| {
-                if sel_idx < gs.buildings.len() {
-                    let sb = &gs.buildings[sel_idx];
-                    sb.tile_x == b.tile_x && sb.tile_y == b.tile_y
-                } else { false }
-            });
+            let is_selected = b.selected && Some(b.owner_id) == gs.my_id;
 
             if is_selected {
                 let hp_ratio = (b.hp / max_hp).clamp(0.0, 1.0);
@@ -2398,6 +2540,14 @@ pub fn run_game() -> Result<(), JsValue> {
                     buffer.line(prev_sx, prev_sy, p_sx, p_sy, 255, 255, 255, true);
                     prev_sx = p_sx;
                     prev_sy = p_sy;
+                }
+
+                // Draw target marker (small white square) at the final destination
+                if let Some(target) = u.path.first() {
+                    let tx = ((target.0 - cam_x) * zoom + screen_center_x) as i32;
+                    let ty = ((target.1 - cam_y) * zoom + screen_center_y) as i32;
+                    let size = (4.0 * zoom).max(2.0) as i32; 
+                    buffer.rect(tx - size/2, ty - size/2, size, size, 255, 255, 255);
                 }
             }
             
@@ -2493,22 +2643,26 @@ pub fn run_game() -> Result<(), JsValue> {
         
         // Deselect All Button (Left of Home)
         let any_unit_selected = gs.units.iter().any(|u| u.selected && Some(u.owner_id) == gs.my_id);
-        if any_unit_selected || gs.selected_building.is_some() || gs.selected_build.is_some() {
+        let any_building_selected = gs.buildings.iter().any(|b| b.selected && Some(b.owner_id) == gs.my_id);
+        if any_unit_selected || any_building_selected || gs.selected_build.is_some() {
             let deselect_btn_x = home_btn_x - btn_size - 10.0;
             let deselect_btn_y = home_btn_y;
             
             buffer.rect(deselect_btn_x as i32, deselect_btn_y as i32, btn_size as i32, btn_size as i32, 80, 80, 80);
             
-            // Thin X
+            // Thicker, Larger X
             let center_x = deselect_btn_x + btn_size / 2.0;
             let center_y = deselect_btn_y + btn_size / 2.0;
-            let arm_len = 10.0;
+            let arm_len = 16.0; // Increased from 10.0 to match box scale better
             
-            // Draw X lines manually
-            // Top-left to Bottom-right
-            buffer.line((center_x - arm_len/2.0) as i32, (center_y - arm_len/2.0) as i32, (center_x + arm_len/2.0) as i32, (center_y + arm_len/2.0) as i32, 200, 200, 200, false);
-            // Top-right to Bottom-left
-            buffer.line((center_x + arm_len/2.0) as i32, (center_y - arm_len/2.0) as i32, (center_x - arm_len/2.0) as i32, (center_y + arm_len/2.0) as i32, 200, 200, 200, false);
+            // Draw X lines manually with thickness
+            for off in 0..2 {
+                let offset = off as f32;
+                // Top-left to Bottom-right
+                buffer.line((center_x - arm_len/2.0 + offset) as i32, (center_y - arm_len/2.0) as i32, (center_x + arm_len/2.0 + offset) as i32, (center_y + arm_len/2.0) as i32, 255, 255, 255, false);
+                // Top-right to Bottom-left
+                buffer.line((center_x + arm_len/2.0 - offset) as i32, (center_y - arm_len/2.0) as i32, (center_x - arm_len/2.0 - offset) as i32, (center_y + arm_len/2.0) as i32, 255, 255, 255, false);
+            }
         }
         
         // Group Select Button (Right of Home) - Simple box outline icon
@@ -2520,25 +2674,27 @@ pub fn run_game() -> Result<(), JsValue> {
         buffer.rect_outline((group_btn_x + 8.0) as i32, (group_btn_y + 8.0) as i32, 24, 24, 255, 255, 255);
 
         // Action Button (Left) - Context-dependent
-        if let Some(b_idx) = gs.selected_building {
-             if b_idx < gs.buildings.len() && Some(gs.buildings[b_idx].owner_id) == gs.my_id {
-                if gs.buildings[b_idx].kind == 0 {
-                     // Spawn Worker Button
-                     buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
-                     // Plus icon
-                     buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, 0, 255, 0);
-                     buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, 0, 255, 0);
-                 } else if gs.buildings[b_idx].kind == BuildKind::Barracks.to_kind_id() {
-                     // Train Warrior Button
-                     buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 120, 40, 40);
-                     buffer.rect(18, (home_btn_y + 10.0) as i32, 24, 6, 255, 255, 255);
-                     buffer.rect(20, (home_btn_y + 16.0) as i32, 6, 18, 255, 255, 255);
-                     buffer.rect(32, (home_btn_y + 16.0) as i32, 6, 18, 255, 255, 255);
-                 }
+        // Check if exactly one building is selected (primary selection)
+        let selected_buildings_list: Vec<_> = gs.buildings.iter().filter(|b| b.selected && Some(b.owner_id) == gs.my_id).collect();
+        if selected_buildings_list.len() == 1 {
+             let b = selected_buildings_list[0];
+             if b.kind == 0 {
+                 // Spawn Worker Button
+                 buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
+                 // Plus icon
+                 buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, 0, 255, 0);
+                 buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, 0, 255, 0);
+             } else if b.kind == BuildKind::Barracks.to_kind_id() {
+                 // Train Warrior Button
+                 buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 120, 40, 40);
+                 buffer.rect(18, (home_btn_y + 10.0) as i32, 24, 6, 255, 255, 255);
+                 buffer.rect(20, (home_btn_y + 16.0) as i32, 6, 18, 255, 255, 255);
+                 buffer.rect(32, (home_btn_y + 16.0) as i32, 6, 18, 255, 255, 255);
              }
         } else {
             let any_unit_selected = gs.units.iter().any(|u| u.selected && Some(u.owner_id) == gs.my_id);
             if any_unit_selected {
+
                  // Build button opens submenu
                  let build_color = if gs.build_menu_open { (0, 200, 0) } else { (0, 0, 150) };
                  buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, build_color.0, build_color.1, build_color.2);
@@ -2604,6 +2760,31 @@ pub fn run_game() -> Result<(), JsValue> {
             }
         }
         
+        // --- DELETE BUTTON (Right) ---
+        // Only show if exactly 1 entity is selected
+        let selected_units_count = gs.units.iter().filter(|u| u.selected && Some(u.owner_id) == gs.my_id).count();
+        let selected_buildings_list: Vec<_> = gs.buildings.iter().filter(|b| b.selected && Some(b.owner_id) == gs.my_id).collect();
+        let total_selected = selected_units_count + selected_buildings_list.len();
+        
+        if total_selected == 1 && !gs.build_mode {
+             let show_delete = if let Some(b) = selected_buildings_list.first() {
+                 b.kind != 0 // Not Town Center
+             } else {
+                 true // Unit
+             };
+
+             if show_delete {
+                 let del_btn_x = WIDTH as f32 - btn_size - 10.0;
+                 let del_btn_y = home_btn_y;
+                 
+                 // Red background (Blocky)
+                 buffer.rect(del_btn_x as i32, del_btn_y as i32, btn_size as i32, btn_size as i32, 200, 50, 50);
+                 
+                 // White Minus Sign (Thick, Blocky)
+                 buffer.rect((del_btn_x + 8.0) as i32, (del_btn_y + 17.0) as i32, 24, 6, 255, 255, 255);
+             }
+        }
+        
         // --- CONFIRM/CANCEL BUTTONS (when wall placement ready) ---
         if gs.build_mode && gs.wall_end.is_some() {
             // Confirm button (green) - right side
@@ -2641,37 +2822,75 @@ pub fn run_game() -> Result<(), JsValue> {
             }
         }
         
-        // --- SELECTED UNITS DISPLAY (Above footer, RIGHT SIDE) ---
+        // --- SELECTED ENTITIES DISPLAY (Above footer, CENTERED) ---
+        // Combine units and buildings
         let selected_units: Vec<_> = gs.units.iter().filter(|u| u.selected && Some(u.owner_id) == gs.my_id).collect();
-        if !selected_units.is_empty() {
+        let selected_buildings: Vec<_> = gs.buildings.iter().filter(|b| b.selected && Some(b.owner_id) == gs.my_id).collect();
+        let total_selected = selected_units.len() + selected_buildings.len();
+        
+        if total_selected > 0 {
             let unit_icon_size = 20.0;
+            let gap = 4.0;
             let icons_y = HEIGHT as f32 - footer_height - unit_icon_size - 5.0;
-            let max_display = 10; // Max icons to show
+            let max_display = 10;
             
-            for (i, u) in selected_units.iter().take(max_display).enumerate() {
-                let icon_x = WIDTH as f32 - 10.0 - unit_icon_size - (i as f32 * (unit_icon_size + 4.0));
-                // Draw unit color square
+            let count = total_selected.min(max_display);
+            let has_overflow = total_selected > max_display;
+            let total_items = count + if has_overflow { 1 } else { 0 };
+            
+            let total_width = (total_items as f32 * unit_icon_size) + ((total_items as f32 - 1.0).max(0.0) * gap);
+            let start_x = (WIDTH as f32 - total_width) / 2.0;
+            
+            let mut drawn_count = 0;
+            
+            // Draw Units
+            for u in selected_units.iter().take(count) {
+                let icon_x = start_x + (drawn_count as f32 * (unit_icon_size + gap));
                 buffer.rect(icon_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, u.color.0, u.color.1, u.color.2);
-                // Border
                 buffer.rect_outline(icon_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, 255, 255, 255);
+                drawn_count += 1;
             }
             
-            // If more than max, show "+N"
-            if selected_units.len() > max_display {
-                let _extra = selected_units.len() - max_display;
-                let text_x = WIDTH as f32 - 10.0 - unit_icon_size - (max_display as f32 * (unit_icon_size + 4.0));
-                // Simple "+N" indicator (just a small box with different color)
+            // Draw Buildings
+            if drawn_count < count {
+                for b in selected_buildings.iter().take(count - drawn_count) {
+                    let icon_x = start_x + (drawn_count as f32 * (unit_icon_size + gap));
+                    
+                    // Building color based on kind
+                    let color = match b.kind {
+                        0 => (0, 0, 150), // Town Center
+                        1 => (80, 80, 180), // Wall
+                        2 => (60, 130, 60), // Farm
+                        3 => (210, 190, 140), // House
+                        4 => (140, 140, 160), // Tower
+                        5 => (160, 80, 80), // Barracks
+                        _ => (100, 100, 100),
+                    };
+                    
+                    buffer.rect(icon_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, color.0, color.1, color.2);
+                    
+                    // Tiny detail to distinguish buildings
+                    if b.kind == 0 {
+                        buffer.rect((icon_x + 6.0) as i32, (icons_y + 6.0) as i32, 8, 8, 255, 255, 255);
+                    }
+                    
+                    buffer.rect_outline(icon_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, 255, 255, 255);
+                    drawn_count += 1;
+                }
+            }
+            
+            // Overflow
+            if has_overflow {
+                let text_x = start_x + (count as f32 * (unit_icon_size + gap));
                 buffer.rect(text_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, 100, 100, 100);
-                // Plus sign to indicate "more"
                 buffer.rect((text_x + 7.0) as i32, (icons_y + 9.0) as i32, 6, 2, 255, 255, 255);
                 buffer.rect((text_x + 9.0) as i32, (icons_y + 7.0) as i32, 2, 6, 255, 255, 255);
             }
         }
         
-        // Draw Selection Outline for Building (TOP-LEFT based like tiles)
-        if let Some(b_idx) = gs.selected_building {
-            if b_idx < gs.buildings.len() {
-                let b = &gs.buildings[b_idx];
+        // Draw Selection Outline for Buildings (TOP-LEFT based like tiles)
+        for b in &gs.buildings {
+            if b.selected && Some(b.owner_id) == gs.my_id {
                 let tile_world_x = b.tile_x as f32 * TILE_SIZE_BASE;
                 let tile_world_y = b.tile_y as f32 * TILE_SIZE_BASE;
                 let sx = (tile_world_x - cam_x) * zoom + screen_center_x;

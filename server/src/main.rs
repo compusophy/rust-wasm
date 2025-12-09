@@ -69,6 +69,8 @@ enum GameMessage {
     UnitHp { owner_id: i32, unit_idx: usize, hp: f32 },
     BuildingHp { tile_x: i32, tile_y: i32, hp: f32 },
     ResourceUpdate { player_id: i32, resources: Resources, pop_cap: i32, pop_used: i32 },
+    DeleteUnit { unit_idx: usize },
+    DeleteBuilding { tile_x: i32, tile_y: i32 },
     Error { message: String },
 }
 
@@ -1345,6 +1347,11 @@ async fn handle_connection(
                             }
                         },
                         GameMessage::TrainUnit { building_id, kind } => {
+                            // ... (existing code) ...
+                            // To match 'new_string' block requirements, I will just paste the handling logic for delete messages after this block in a separate replace call or try to fit it if context allows.
+                            // Actually, I should use a separate replace for the match arm insertion to be safe.
+                            // But I need to match the 'match msg {' block structure.
+
                             // Only warrior supported for now
                             if kind != 1 { continue; }
                             let building = {
@@ -1529,6 +1536,106 @@ async fn handle_connection(
                             if let Some(msg) = res_msg {
                                 if let Ok(json) = serde_json::to_string(&msg) {
                                     let _ = tx.send(json);
+                                }
+                            }
+                        },
+                        GameMessage::DeleteUnit { unit_idx } => {
+                            let mut pid_to_update = None;
+                            {
+                                if let Ok(mut gs) = recv_state.try_lock() {
+                                    if let Some(units) = gs.units.get_mut(&player_id) {
+                                        // Unit idx in message is the player-specific index
+                                        if unit_idx < units.len() {
+                                            units.remove(unit_idx);
+                                            pid_to_update = Some(player_id);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if let Some(pid) = pid_to_update {
+                                // DB Update
+                                if let Some(p) = &recv_pool {
+                                    let _ = sqlx::query("DELETE FROM units WHERE owner_id = $1 AND unit_idx = $2")
+                                        .bind(pid)
+                                        .bind(unit_idx as i32)
+                                        .execute(p)
+                                        .await;
+                                    // Shift indices to keep them contiguous?
+                                    // If we don't shift, the indices in DB might have gaps.
+                                    // But 'units' vector in memory shifts.
+                                    // So unit at index 5 becomes index 4.
+                                    // The client sends index 4 next time.
+                                    // But DB still has it as 5?
+                                    // YES. We MUST shift DB indices or use IDs.
+                                    // Using indices is fragile. 
+                                    // Let's shift.
+                                    let _ = sqlx::query("UPDATE units SET unit_idx = unit_idx - 1 WHERE owner_id = $1 AND unit_idx > $2")
+                                        .bind(pid)
+                                        .bind(unit_idx as i32)
+                                        .execute(p)
+                                        .await;
+                                }
+                                
+                                // Broadcast Death
+                                let _ = tx.send(serde_json::to_string(&GameMessage::UnitDied { owner_id: pid, unit_idx }).unwrap());
+                                
+                                // Broadcast Resource/Pop Update
+                                let gs = recv_state.lock().await;
+                                let pop_used = gs.units.get(&pid).map(|u| u.len() as i32).unwrap_or(0);
+                                let pop_cap = *gs.pop_cap.get(&pid).unwrap_or(&default_pop_cap());
+                                let res = *gs.resources.get(&pid).unwrap_or(&default_resources());
+                                let _ = tx.send(serde_json::to_string(&GameMessage::ResourceUpdate { 
+                                    player_id: pid, resources: res, pop_cap, pop_used 
+                                }).unwrap());
+                            }
+                        },
+                        GameMessage::DeleteBuilding { tile_x, tile_y } => {
+                            let mut destroyed = false;
+                            let mut owner = 0;
+                            let mut is_house = false;
+                            
+                            {
+                                if let Ok(mut gs) = recv_state.try_lock() {
+                                    if let Some(idx) = gs.buildings.iter().position(|b| b.tile_x == tile_x && b.tile_y == tile_y) {
+                                        let b = &gs.buildings[idx];
+                                        if b.owner_id == player_id && b.kind != 0 { // Cannot delete Town Center (kind 0)
+                                            owner = b.owner_id;
+                                            is_house = b.kind == 3;
+                                            gs.buildings.remove(idx);
+                                            destroyed = true;
+                                            
+                                            if is_house {
+                                                let cap = gs.pop_cap.entry(owner).or_insert(default_pop_cap());
+                                                *cap = (*cap - POP_FROM_HOUSE).max(default_pop_cap());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if destroyed {
+                                // DB Update
+                                if let Some(p) = &recv_pool {
+                                    let _ = sqlx::query("DELETE FROM buildings WHERE tile_x = $1 AND tile_y = $2")
+                                        .bind(tile_x)
+                                        .bind(tile_y)
+                                        .execute(p)
+                                        .await;
+                                }
+                                
+                                // Broadcast Destroyed
+                                let _ = tx.send(serde_json::to_string(&GameMessage::BuildingDestroyed { tile_x, tile_y }).unwrap());
+                                
+                                // Broadcast Resource/Pop Update (if house)
+                                if is_house {
+                                    let gs = recv_state.lock().await;
+                                    let pop_used = gs.units.get(&owner).map(|u| u.len() as i32).unwrap_or(0);
+                                    let pop_cap = *gs.pop_cap.get(&owner).unwrap_or(&default_pop_cap());
+                                    let res = *gs.resources.get(&owner).unwrap_or(&default_resources());
+                                    let _ = tx.send(serde_json::to_string(&GameMessage::ResourceUpdate { 
+                                        player_id: owner, resources: res, pop_cap, pop_used 
+                                    }).unwrap());
                                 }
                             }
                         },
