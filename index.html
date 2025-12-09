@@ -16,127 +16,25 @@
     
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
-        /* Mobile browser safe area support */
         :root {
             --sat: env(safe-area-inset-top, 0px);
-            --sar: env(safe-area-inset-right, 0px);
-            --sab: env(safe-area-inset-bottom, 0px);
-            --sal: env(safe-area-inset-left, 0px);
         }
-        
-        html, body { 
-            margin: 0; 
+        html, body {
+            margin: 0;
             padding: 0;
-            font-family: sans-serif; 
-            background-color: #222;
-            color: #eee;
+            background: #000;
             overflow: hidden;
             position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            height: 100%;
-            width: 100%;
+            inset: 0;
             display: flex;
             justify-content: center;
-            /* TOP ALIGN - so browser footer cuts bottom of canvas, not our UI */
             align-items: flex-start;
             padding-top: var(--sat);
-            box-sizing: border-box;
         }
-        
-        /* The Main Game Canvas */
         #temty-canvas {
-            background-color: #000;
-            box-shadow: 0 0 20px rgba(0,0,0,0.5);
-            border: 1px solid #444;
-            /* Prevent browser gestures on canvas */
+            background: #000;
             touch-action: none;
-            -webkit-touch-callout: none;
             -webkit-user-select: none;
-            user-select: none;
-        }
-        
-        /* Prevent pull-to-refresh and overscroll */
-        body {
-            overscroll-behavior: none;
-            -webkit-overflow-scrolling: touch;
-        }
-
-        /* Chat Container - Keeping this as HTML overlay for now as requested in previous steps, 
-           unless user wants this in canvas too. It's usually better as DOM. */
-        .chat-container { 
-            display: none;
-        }
-
-        .chat-header {
-            background: #111;
-            color: #eee;
-            padding: 10px;
-            font-weight: bold;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid #444;
-        }
-        
-        #connection-status {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background-color: #999;
-            display: inline-block;
-            margin-left: 10px;
-            transition: background-color 0.3s;
-        }
-
-        .status-connected { background-color: #4caf50 !important; box-shadow: 0 0 4px #4caf50; }
-        .status-disconnected { background-color: #f44336 !important; }
-        .status-error { background-color: #ff9800 !important; }
-
-        #chat-messages { 
-            height: 200px; 
-            overflow-y: auto; 
-            padding: 10px;
-            font-size: 0.9em;
-        }
-
-        .chat-input-area {
-            padding: 10px;
-            border-top: 1px solid #444;
-            display: flex;
-            gap: 5px;
-        }
-
-        #message-input { 
-            flex-grow: 1; 
-            padding: 5px; 
-            background: #333; 
-            border: 1px solid #555; 
-            color: white;
-            border-radius: 3px;
-        }
-        
-        #send-btn { 
-            padding: 5px 10px; 
-            background: #444; 
-            color: white; 
-            border: 1px solid #555; 
-            cursor: pointer; 
-            border-radius: 3px;
-        }
-        
-        #send-btn:hover { background: #555; }
-
-        #minimize-chat { display: none; }
-        #minimize-chat:checked ~ .chat-content-wrapper { display: none; }
-        .chat-container:has(#minimize-chat:checked) { width: auto; min-width: 150px; }
-        
-        .minimize-btn {
-            cursor: pointer;
-            font-weight: bold;
-            padding: 0 5px;
             user-select: none;
         }
     </style>
@@ -145,55 +43,14 @@
     <!-- The Rust Canvas -->
     <canvas id="temty-canvas" width="360" height="640"></canvas>
 
-    <!-- Chat Overlay -->
-    <div class="chat-container">
-        <input type="checkbox" id="minimize-chat">
-        <div class="chat-header">
-            <span>Chat</span>
-            <div style="display:flex; align-items:center; gap: 10px;">
-                <div id="connection-status" title="Disconnected"></div>
-                <label for="minimize-chat" class="minimize-btn">_</label>
-            </div>
-        </div>
-        <div class="chat-content-wrapper">
-            <div id="chat-messages"></div>
-            <div class="chat-input-area">
-                <input type="text" id="message-input" placeholder="Type..." disabled>
-                <button id="send-btn" onclick="sendMessage()" disabled>Send</button>
-            </div>
-        </div>
-    </div>
-
     <script type="module">
         import { sdk } from 'https://esm.sh/@farcaster/miniapp-sdk'
-        import init, { ChatClient, run_game } from './pkg/temty.js';
-
-        let client;
-        const statusEl = document.getElementById('connection-status');
-        const inputEl = document.getElementById('message-input');
-        const btnEl = document.getElementById('send-btn');
-
-        function setConnected(connected) {
-            if (connected) {
-                statusEl.className = 'status-connected';
-                statusEl.title = 'Connected';
-                inputEl.disabled = false;
-                btnEl.disabled = false;
-                // Focus input on connect
-                inputEl.focus();
-            } else {
-                statusEl.className = 'status-disconnected';
-                statusEl.title = 'Disconnected';
-                // Don't disable immediately on error to allow retries or viewing
-                // inputEl.disabled = true; 
-                // btnEl.disabled = true;
-            }
-        }
+        import init, { run_game } from './pkg/temty.js';
 
         async function start() {
             try {
                 // Cache busting to ensure we load the new WASM version
-                await init('./pkg/temty_bg.wasm?v=20');
+                await init('./pkg/temty_bg.wasm?v=21');
             } catch(e) {
                 console.error("WASM init failed:", e);
                 statusEl.className = 'status-error';
@@ -207,49 +64,7 @@
                 sdk.actions.ready({ disableNativeGestures: true });
             } catch(e) {
                 console.error("Game loop failed to start:", e);
-                // Continue to chat even if game fails
             }
-
-            // Intercept logs to handle WS errors roughly
-            const originalLog = console.log;
-            console.log = (...args) => {
-                originalLog(...args);
-                if (args[0] && typeof args[0] === 'string' && args[0].includes('WebSocket error')) {
-                    statusEl.className = 'status-disconnected';
-                }
-            };
-
-            // Connect Chat
-            const wsUrl = 'wss://temty-server-production.up.railway.app';
-            // const wsUrl = 'ws://localhost:9001';
-            try {
-                client = new ChatClient(wsUrl);
-                setConnected(true);
-            } catch (e) {
-                console.error("Chat connect failed:", e);
-                statusEl.className = 'status-error';
-                inputEl.disabled = false; // Allow typing even if initial connect fails (maybe we'll add retry later)
-            }
-
-            window.sendMessage = () => {
-                if (inputEl.value && client) {
-                    try {
-                        client.send_message(inputEl.value);
-                        inputEl.value = '';
-                    } catch (e) {
-                        console.error("Send failed:", e);
-                        statusEl.className = 'status-disconnected';
-                    }
-                }
-            };
-            
-            inputEl.addEventListener('keypress', (e) => {
-                if (e.key === 'Enter') window.sendMessage();
-            });
-            
-            // Ensure input is enabled if it was stuck
-            inputEl.disabled = false;
-            btnEl.disabled = false;
         }
 
         start();

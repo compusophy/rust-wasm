@@ -31,6 +31,8 @@ struct UnitDTO {
     unit_idx: usize,
     x: f32,
     y: f32,
+    kind: u8,
+    hp: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -40,24 +42,34 @@ struct BuildingDTO {
     kind: u8,
     tile_x: i32,
     tile_y: i32,
+    hp: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 enum GameMessage {
     Join { version: u32, token: Option<String> },
-    Welcome { player_id: i32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo>, units: Vec<UnitDTO>, buildings: Vec<BuildingDTO>, token: String },
+    Welcome { player_id: i32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo>, units: Vec<UnitDTO>, buildings: Vec<BuildingDTO>, token: String, resources: Resources, pop_cap: i32, pop_used: i32 },
     NewPlayer { player: PlayerInfo },
     UnitMove { player_id: i32, unit_idx: usize, x: f32, y: f32 },
     UnitSync { player_id: i32, unit_idx: usize, x: f32, y: f32 },
     SpawnUnit, 
+    TrainUnit { building_id: i32, kind: u8 },
     UnitSpawned { unit: UnitDTO },
     Build { kind: u8, tile_x: i32, tile_y: i32 },
+    BuildProgress { tile_x: i32, tile_y: i32, kind: u8, progress: f32 },
     BuildingSpawned { building: BuildingDTO },
+    AssignGather { unit_ids: Vec<usize>, target_x: i32, target_y: i32, kind: u8 },
+    TowerShot { x1: f32, y1: f32, x2: f32, y2: f32 },
+    UnitDied { owner_id: i32, unit_idx: usize },
+    BuildingDestroyed { tile_x: i32, tile_y: i32 },
+    UnitHp { owner_id: i32, unit_idx: usize, hp: f32 },
+    BuildingHp { tile_x: i32, tile_y: i32, hp: f32 },
+    ResourceUpdate { player_id: i32, resources: Resources, pop_cap: i32, pop_used: i32 },
     Error { message: String },
 }
 
-const CLIENT_VERSION: u32 = 20;
+const CLIENT_VERSION: u32 = 22;
 
 // --- CHAT CLIENT ---
 #[wasm_bindgen]
@@ -85,6 +97,131 @@ const WIDTH: u32 = 360;
 const HEIGHT: u32 = 640;
 const CHUNK_SIZE: i32 = 32; // User requested 32x32 plot per player
 const TILE_SIZE_BASE: f32 = 16.0;
+
+// --- ECONOMY / COSTS ---
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct Resources {
+    wood: f32,
+    stone: f32,
+    gold: f32,
+    food: f32,
+}
+
+impl Resources {
+    fn new(wood: f32, stone: f32, gold: f32, food: f32) -> Self {
+        Resources { wood, stone, gold, food }
+    }
+
+    fn has(&self, cost: &Resources) -> bool {
+        self.wood >= cost.wood && self.stone >= cost.stone && self.gold >= cost.gold && self.food >= cost.food
+    }
+
+}
+
+const COST_WALL: Resources = Resources { wood: 1.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_FARM: Resources = Resources { wood: 30.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_HOUSE: Resources = Resources { wood: 25.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_TOWER: Resources = Resources { wood: 0.0, stone: 40.0, gold: 0.0, food: 0.0 };
+const COST_BARRACKS: Resources = Resources { wood: 60.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_WORKER: Resources = Resources { wood: 0.0, stone: 0.0, gold: 0.0, food: 50.0 };
+const COST_WARRIOR: Resources = Resources { wood: 0.0, stone: 0.0, gold: 20.0, food: 40.0 };
+const WORKER_HP: f32 = 50.0;
+const WARRIOR_HP: f32 = 120.0;
+const TOWN_HP: f32 = 800.0;
+const WALL_HP: f32 = 200.0;
+const TOWER_HP: f32 = 300.0;
+const FARM_HP: f32 = 220.0;
+const HOUSE_HP: f32 = 220.0;
+const BARRACKS_HP: f32 = 260.0;
+
+// --- BUILDING & UNIT KINDS ---
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildKind {
+    Wall,
+    Farm,
+    House,
+    Tower,
+    Barracks,
+}
+
+impl BuildKind {
+    fn to_kind_id(&self) -> u8 {
+        match self {
+            BuildKind::Wall => 1,
+            BuildKind::Farm => 2,
+            BuildKind::House => 3,
+            BuildKind::Tower => 4,
+            BuildKind::Barracks => 5,
+        }
+    }
+
+    fn cost(&self) -> Resources {
+        match self {
+            BuildKind::Wall => COST_WALL,
+            BuildKind::Farm => COST_FARM,
+            BuildKind::House => COST_HOUSE,
+            BuildKind::Tower => COST_TOWER,
+            BuildKind::Barracks => COST_BARRACKS,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnitKind {
+    Worker,
+    Warrior,
+}
+
+impl UnitKind {
+    fn to_u8(&self) -> u8 {
+        match self {
+            UnitKind::Worker => 0,
+            UnitKind::Warrior => 1,
+        }
+    }
+}
+
+struct TowerShot {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    ttl: f32,
+}
+
+#[derive(Clone, Copy)]
+struct TileProgress {
+    progress: f32,
+}
+
+#[derive(Clone, Copy)]
+enum WsState {
+    Connecting,
+    Connected,
+    Error,
+    Closed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GatherKind {
+    Wood,
+    Stone,
+    Gold,
+    Farm,
+}
+
+#[derive(Clone, Copy)]
+struct GatherJob {
+    kind: GatherKind,
+    target: (i32, i32), // tile target (for farm, the farm tile)
+}
+
+#[derive(Clone, Copy)]
+enum UnitJob {
+    Idle,
+    Gathering(GatherJob),
+    Building(u32), // build project id
+}
 
 struct PixelBuffer {
     width: u32,
@@ -207,13 +344,17 @@ struct Unit {
     kind: u8,
     color: (u8, u8, u8),
     owner_id: i32, // Synced Owner ID
+    job: UnitJob,
+    hp: f32,
 }
 
 struct Building {
+    id: i32,
     tile_x: i32, // Global Tile Pos
     tile_y: i32,
     kind: u8,
     owner_id: i32, // Added owner tracking for coloring
+    hp: f32,
 }
 
 struct Chunk {
@@ -224,6 +365,13 @@ struct GameState {
     chunks: HashMap<(i32, i32), Chunk>,
     units: Vec<Unit>,
     buildings: Vec<Building>,
+    resources: Resources,
+    pop_cap: i32,
+    pop_used: i32,
+    build_menu_open: bool,
+    selected_build: Option<BuildKind>,
+    tower_shots: Vec<TowerShot>,
+    server_progress: HashMap<(i32, i32), TileProgress>,
     
     // Camera
     camera_x: f32, // Center of view in World Coords
@@ -236,6 +384,7 @@ struct GameState {
     my_chunk_y: i32,
     other_players: Vec<PlayerInfo>,
     socket: Option<WebSocket>, // For sending commands
+    ws_state: WsState,
 
     // Input State
     last_touch_dist: Option<f32>,
@@ -278,6 +427,13 @@ impl GameState {
             chunks: HashMap::new(),
             units: Vec::new(),
             buildings: Vec::new(),
+            resources: Resources::new(150.0, 60.0, 60.0, 100.0),
+            pop_cap: 5,
+            pop_used: 0,
+            build_menu_open: false,
+            selected_build: None,
+            tower_shots: Vec::new(),
+            server_progress: HashMap::new(),
             camera_x: 0.0,
             camera_y: 0.0,
             zoom: 1.0,
@@ -286,6 +442,7 @@ impl GameState {
             my_chunk_y: 0,
             other_players: Vec::new(),
             socket: None,
+            ws_state: WsState::Connecting,
             last_touch_dist: None,
             last_pan_x: None,
             last_pan_y: None,
@@ -326,16 +483,22 @@ impl GameState {
         
         let color = if Some(pid) == self.my_id { (0, 0, 255) } else { (255, 0, 0) };
         
-        self.units.push(Unit { x: sx + 30.0, y: sy + 30.0, path: Vec::new(), selected: false, kind: 0, color, owner_id: pid });
-        self.units.push(Unit { x: sx - 20.0, y: sy + 40.0, path: Vec::new(), selected: false, kind: 0, color, owner_id: pid });
+        self.units.push(Unit { x: sx + 30.0, y: sy + 30.0, path: Vec::new(), selected: false, kind: UnitKind::Worker.to_u8(), color, owner_id: pid, job: UnitJob::Idle, hp: WORKER_HP });
+        self.units.push(Unit { x: sx - 20.0, y: sy + 40.0, path: Vec::new(), selected: false, kind: UnitKind::Worker.to_u8(), color, owner_id: pid, job: UnitJob::Idle, hp: WORKER_HP });
+        if Some(pid) == self.my_id {
+            self.pop_used += 2;
+        }
         
         // Spawn Building for this player
         let mid = CHUNK_SIZE / 2;
+        let tid = cx * CHUNK_SIZE + mid + (cy * CHUNK_SIZE + mid) * 100000;
         self.buildings.push(Building { 
+            id: tid,
             tile_x: cx * CHUNK_SIZE + mid, 
             tile_y: cy * CHUNK_SIZE + mid, 
             kind: 0,
-            owner_id: pid 
+            owner_id: pid,
+            hp: TOWN_HP,
         });
     }
 
@@ -644,6 +807,16 @@ impl GameState {
             u.y = y;
             if pop { u.path.pop(); }
         }
+
+        // --- BUILD PROGRESS ---
+        // Now authoritative on server; only render server progress.
+        // --- GATHERING PROGRESS ---
+        self.update_gathering(dt);
+        // --- TOWER SHOTS (server-driven; only decay TTL) ---
+        for s in &mut self.tower_shots {
+            s.ttl -= dt as f32;
+        }
+        self.tower_shots.retain(|s| s.ttl > 0.0);
         
         // --- SYNC LOGIC ---
         // Send UnitSync for MY units every 100ms
@@ -764,11 +937,30 @@ impl GameState {
                     
                     if screen_x >= spawn_btn_x && screen_x <= spawn_btn_x + btn_size &&
                        screen_y >= spawn_btn_y && screen_y <= spawn_btn_y + btn_size {
+                        // Resource + pop-cap gating (client-side optimistic, server authoritative)
+                        if self.pop_used >= self.pop_cap { return; }
+                        if !self.can_afford(&COST_WORKER) { return; }
                         if let Some(ws) = &self.socket {
                              let msg = GameMessage::SpawnUnit;
                              if let Ok(json) = serde_json::to_string(&msg) {
                                  let _ = ws.send_with_str(&json);
                              }
+                        }
+                        return;
+                    }
+                } else if b_idx < self.buildings.len() && self.buildings[b_idx].kind == BuildKind::Barracks.to_kind_id() {
+                    let train_btn_x = 10.0;
+                    let train_btn_y = home_btn_y;
+                    if screen_x >= train_btn_x && screen_x <= train_btn_x + btn_size &&
+                       screen_y >= train_btn_y && screen_y <= train_btn_y + btn_size {
+                        if self.pop_used >= self.pop_cap { return; }
+                        if !self.can_afford(&COST_WARRIOR) { return; }
+                        if let Some(ws) = &self.socket {
+                            let building_id = self.buildings[b_idx].id;
+                            let msg = GameMessage::TrainUnit { building_id, kind: UnitKind::Warrior.to_u8() };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = ws.send_with_str(&json);
+                            }
                         }
                         return;
                     }
@@ -784,15 +976,48 @@ impl GameState {
                     
                     if screen_x >= build_btn_x && screen_x <= build_btn_x + btn_size &&
                        screen_y >= build_btn_y && screen_y <= build_btn_y + btn_size {
-                        // Toggle build mode
-                        self.build_mode = !self.build_mode;
-                        if !self.build_mode {
-                            // Clear wall placement state when exiting build mode
+                        // Toggle build submenu
+                        self.build_menu_open = !self.build_menu_open;
+                        if !self.build_menu_open {
+                            self.selected_build = None;
+                            self.build_mode = false;
                             self.wall_start = None;
                             self.wall_end = None;
                             self.wall_preview.clear();
                         }
                         return;
+                    }
+
+                    // Build submenu options (vertical list above build button)
+                    if self.build_menu_open {
+                        let options = [
+                            BuildKind::Wall,
+                            BuildKind::Farm,
+                            BuildKind::House,
+                            BuildKind::Tower,
+                            BuildKind::Barracks,
+                        ];
+                        for (idx, kind) in options.iter().enumerate() {
+                            let opt_y = build_btn_y - ((idx as f32 + 1.0) * (btn_size + 6.0));
+                            if screen_x >= build_btn_x && screen_x <= build_btn_x + btn_size &&
+                               screen_y >= opt_y && screen_y <= opt_y + btn_size {
+                                if *kind == BuildKind::Wall {
+                                    self.selected_build = Some(BuildKind::Wall);
+                                    self.build_mode = true;
+                                    self.wall_start = None;
+                                    self.wall_end = None;
+                                    self.wall_preview.clear();
+                                } else {
+                                    self.selected_build = Some(*kind);
+                                    self.build_mode = false;
+                                    self.wall_start = None;
+                                    self.wall_end = None;
+                                    self.wall_preview.clear();
+                                }
+                                self.build_menu_open = false;
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -828,6 +1053,24 @@ impl GameState {
         let clicked_tile_x = (wx / TILE_SIZE_BASE).floor() as i32;
         let clicked_tile_y = (wy / TILE_SIZE_BASE).floor() as i32;
         
+        // Handle single-tile building placement (non-wall)
+        if let Some(kind) = self.selected_build {
+            if kind != BuildKind::Wall {
+                if self.is_tile_buildable(clicked_tile_x, clicked_tile_y) {
+                    // Optimistic send; server will validate resources/buildability
+                    if let Some(ws) = &self.socket {
+                        let msg = GameMessage::Build { kind: kind.to_kind_id(), tile_x: clicked_tile_x, tile_y: clicked_tile_y };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            let _ = ws.send_with_str(&json);
+                        }
+                    }
+                    self.selected_build = None;
+                    self.build_menu_open = false;
+                }
+                return;
+            }
+        }
+
         // Handle Build Mode (wall placement)
         if self.build_mode {
             if self.wall_start.is_none() {
@@ -898,6 +1141,12 @@ impl GameState {
                 
                 if wx >= tile_left && wx <= tile_right &&
                    wy >= tile_top && wy <= tile_bottom {
+                       // If units are selected, allow assigning farm work
+                       let any_unit_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
+                       if any_unit_selected && b.kind == BuildKind::Farm.to_kind_id() {
+                           self.assign_gather(GatherKind::Farm, (b.tile_x, b.tile_y));
+                           return;
+                       }
                        self.selected_building = Some(i);
                        clicked_building = true;
                        for u in &mut self.units { u.selected = false; }
@@ -911,6 +1160,25 @@ impl GameState {
                 if !any_unit_selected {
                     self.selected_building = None;
                 } else {
+                    // Resource gathering on resource tiles
+                    if let Some(tile_type) = self.get_tile_type(clicked_tile_x, clicked_tile_y) {
+                        match tile_type {
+                            TileType::Forest => {
+                                self.assign_gather(GatherKind::Wood, (clicked_tile_x, clicked_tile_y));
+                                return;
+                            },
+                            TileType::Mountain => {
+                                self.assign_gather(GatherKind::Stone, (clicked_tile_x, clicked_tile_y));
+                                return;
+                            },
+                            TileType::Gold => {
+                                self.assign_gather(GatherKind::Gold, (clicked_tile_x, clicked_tile_y));
+                                return;
+                            },
+                            _ => {}
+                        }
+                    }
+
                     // Move selected units
                     let mut paths = Vec::new();
                     let mut move_commands = Vec::new();
@@ -940,6 +1208,7 @@ impl GameState {
                     
                     for (i, path) in paths {
                         self.units[i].path = path;
+                        self.units[i].job = UnitJob::Idle;
                     }
                     
                     if let Some(ws) = &self.socket {
@@ -1081,25 +1350,34 @@ impl GameState {
         let tile_type = Self::calculate_tile_type(cx, cy, lx, ly);
         matches!(tile_type, TileType::Grass)
     }
+
+    fn can_afford(&self, cost: &Resources) -> bool {
+        self.resources.has(cost)
+    }
+
+    fn recompute_pop(&mut self) {
+        if let Some(my_id) = self.my_id {
+            self.pop_used = self.units.iter().filter(|u| u.owner_id == my_id).count() as i32;
+        }
+    }
     
     fn confirm_wall_build(&mut self) {
         if self.wall_preview.is_empty() {
             self.cancel_wall_build();
             return;
         }
-        
-        // Send build commands for each tile in preview
+        // Send wall build intents; server will validate and build
         if let Some(ws) = &self.socket {
             for (tx, ty) in &self.wall_preview {
-                let msg = GameMessage::Build { kind: 1, tile_x: *tx, tile_y: *ty };
+                let msg = GameMessage::Build { kind: BuildKind::Wall.to_kind_id(), tile_x: *tx, tile_y: *ty };
                 if let Ok(json) = serde_json::to_string(&msg) {
                     let _ = ws.send_with_str(&json);
                 }
             }
         }
-        
         // Reset build state
         self.build_mode = false;
+        self.selected_build = None;
         self.wall_start = None;
         self.wall_end = None;
         self.wall_preview.clear();
@@ -1111,10 +1389,93 @@ impl GameState {
         self.wall_preview.clear();
         // Keep build_mode on so user can try again
     }
-    
+
+    fn spawn_local_unit(&mut self, pos: (f32, f32), kind: UnitKind) {
+        if let Some(my_id) = self.my_id {
+            let color = (0, 0, 255);
+            self.units.push(Unit {
+                x: pos.0,
+                y: pos.1,
+                path: Vec::new(),
+                selected: false,
+                kind: kind.to_u8(),
+                color,
+                owner_id: my_id,
+                job: UnitJob::Idle,
+                hp: if kind == UnitKind::Warrior { WARRIOR_HP } else { WORKER_HP },
+            });
+            self.pop_used += 1;
+        }
+    }
+
+    fn find_adjacent_walkable(&self, tx: i32, ty: i32) -> Option<(f32, f32)> {
+        let dirs = [(1,0), (-1,0), (0,1), (0,-1)];
+        for (dx, dy) in dirs {
+            let nx = tx + dx;
+            let ny = ty + dy;
+            if self.is_tile_walkable(nx, ny) {
+                return Some((
+                    nx as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0,
+                    ny as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0,
+                ));
+            }
+        }
+        None
+    }
+
+    fn assign_gather(&mut self, kind: GatherKind, target_tile: (i32, i32)) {
+        let my_id = if let Some(id) = self.my_id { id } else { return };
+        if let Some(adj) = self.find_adjacent_walkable(target_tile.0, target_tile.1) {
+            let selected: Vec<(usize, f32, f32)> = self.units.iter().enumerate()
+                .filter(|(_, u)| u.owner_id == my_id && u.selected)
+                .map(|(i, u)| (i, u.x, u.y))
+                .collect();
+
+            let mut unit_ids = Vec::new();
+            for (idx, x, y) in selected {
+                let path = self.find_path((x, y), adj);
+                if let Some(u) = self.units.get_mut(idx) {
+                    u.job = UnitJob::Gathering(GatherJob { kind, target: target_tile });
+                    if !path.is_empty() { u.path = path; }
+                }
+                let mut my_idx = 0;
+                for (k, uu) in self.units.iter().enumerate() {
+                    if uu.owner_id == my_id {
+                        if k == idx { break; }
+                        my_idx += 1;
+                    }
+                }
+                unit_ids.push(my_idx);
+            }
+
+            if let Some(ws) = &self.socket {
+                let msg = GameMessage::AssignGather {
+                    unit_ids,
+                    target_x: target_tile.0,
+                    target_y: target_tile.1,
+                    kind: match kind {
+                        GatherKind::Wood => 2,
+                        GatherKind::Stone => 3,
+                        GatherKind::Gold => 4,
+                        GatherKind::Farm => 2,
+                    },
+                };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    let _ = ws.send_with_str(&json);
+                }
+            }
+        }
+    }
+
+    // Local build progression removed; server is authoritative.
+
+    fn update_gathering(&mut self, _dt: f64) {
+        // Client no longer simulates gathering; server authoritative.
+    }
+
     fn handle_zoom(&mut self, delta_y: f32, mouse_x: f32, mouse_y: f32) {
         // 1. Project mouse screen coords to world coords *before* zoom
-        let (world_x, world_y) = self.screen_to_world(mouse_x, mouse_y);
+        let (_world_x, _world_y) = self.screen_to_world(mouse_x, mouse_y);
 
         // 2. Apply Zoom to Target
         let sensitivity = 0.001;
@@ -1212,8 +1573,11 @@ pub fn run_game() -> Result<(), JsValue> {
     // OnOpen - Send Handshake
     {
         let ws_clone = ws.clone();
+        let state_clone = game_state.clone();
         let onopen_callback = Closure::wrap(Box::new(move || {
-             log("WS Connected. Sending Handshake...");
+             log("WS connected. Sending handshake...");
+             // mark connected
+             state_clone.borrow_mut().ws_state = WsState::Connected;
              // Get token from localStorage
              let window = web_sys::window().unwrap();
              let storage = window.local_storage().unwrap().unwrap();
@@ -1224,6 +1588,28 @@ pub fn run_game() -> Result<(), JsValue> {
         }) as Box<dyn FnMut()>);
         ws.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
         onopen_callback.forget();
+    }
+
+    // OnError - log
+    {
+        let state_clone = game_state.clone();
+        let onerror_callback = Closure::wrap(Box::new(move |e: web_sys::Event| {
+            state_clone.borrow_mut().ws_state = WsState::Error;
+            log(&format!("WS error: {:?}", e.type_()));
+        }) as Box<dyn FnMut(_)>);
+        ws.set_onerror(Some(onerror_callback.as_ref().unchecked_ref()));
+        onerror_callback.forget();
+    }
+
+    // OnClose - log code/reason
+    {
+        let state_clone = game_state.clone();
+        let onclose_callback = Closure::wrap(Box::new(move |e: web_sys::CloseEvent| {
+            state_clone.borrow_mut().ws_state = WsState::Closed;
+            log(&format!("WS closed code={} reason={} was_clean={}", e.code(), e.reason(), e.was_clean()));
+        }) as Box<dyn FnMut(_)>);
+        ws.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
+        onclose_callback.forget();
     }
     
     // OnClose - Handle disconnection (likely due to server restart/update)
@@ -1275,7 +1661,7 @@ pub fn run_game() -> Result<(), JsValue> {
                                 web_sys::window().unwrap().alert_with_message(&message).unwrap();
                             }
                         },
-                        GameMessage::Welcome { player_id, chunk_x, chunk_y, players, units, buildings, token } => {
+                        GameMessage::Welcome { player_id, chunk_x, chunk_y, players, units, buildings, token, resources, pop_cap, pop_used } => {
                             state.my_id = Some(player_id);
                             state.my_chunk_x = chunk_x;
                             state.my_chunk_y = chunk_y;
@@ -1294,21 +1680,33 @@ pub fn run_game() -> Result<(), JsValue> {
                                 state.generate_chunk(p.chunk_x, p.chunk_y);
                                 let mid = CHUNK_SIZE / 2;
                                 state.buildings.push(Building { 
+                                    id: p.chunk_x * CHUNK_SIZE + mid + (p.chunk_y * CHUNK_SIZE + mid) * 100000,
                                     tile_x: p.chunk_x * CHUNK_SIZE + mid, 
                                     tile_y: p.chunk_y * CHUNK_SIZE + mid, 
                                     kind: 0,
-                                    owner_id: p.id
+                                    owner_id: p.id,
+                                    hp: TOWN_HP,
                                 });
                             }
                             
                             // 2. Add Explicit Buildings from DB
                             for b in buildings {
                                 state.buildings.push(Building {
+                                    id: b.id,
                                     tile_x: b.tile_x,
                                     tile_y: b.tile_y,
                                     kind: b.kind,
-                                    owner_id: b.owner_id
+                                    owner_id: b.owner_id,
+                                    hp: b.hp,
                                 });
+                            }
+
+                            // Recalculate population cap from existing houses
+                            if let Some(my_id) = state.my_id {
+                                let house_count = state.buildings.iter().filter(|b| b.owner_id == my_id && b.kind == BuildKind::House.to_kind_id()).count() as i32;
+                                state.pop_cap = 5 + house_count;
+                            } else {
+                                state.pop_cap = 5;
                             }
                             
                             // Move camera to my chunk
@@ -1317,6 +1715,7 @@ pub fn run_game() -> Result<(), JsValue> {
                             
                             // Reset Units and Load from Server
                             state.units.clear();
+                            state.pop_used = 0;
                             
                             for u in units {
                                 let color = if Some(u.owner_id) == state.my_id { (0, 0, 255) } else { (255, 0, 0) };
@@ -1325,11 +1724,22 @@ pub fn run_game() -> Result<(), JsValue> {
                                     y: u.y,
                                     path: Vec::new(), // Server doesn't sync path, units appear idle
                                     selected: false,
-                                    kind: 0,
+                                kind: u.kind,
                                     color,
                                     owner_id: u.owner_id,
+                                    job: UnitJob::Idle,
+                                    hp: u.hp,
                                 });
+                                if Some(u.owner_id) == state.my_id {
+                                    state.pop_used += 1;
+                                }
                             }
+
+                        // Set resources and pop cap from welcome
+                        state.resources = resources;
+                        state.pop_cap = pop_cap;
+                        state.pop_used = pop_used;
+                        state.server_progress.clear();
 
                             log(&format!("Welcome! Assigned to Chunk ({}, {})", chunk_x, chunk_y));
                         },
@@ -1370,10 +1780,10 @@ pub fn run_game() -> Result<(), JsValue> {
                                     let max_wx = start_x.max(x);
                                     let max_wy = start_y.max(y);
 
-                                    let min_cx = (min_wx / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
-                                    let min_cy = (min_wy / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
-                                    let max_cx = (max_wx / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
-                                    let max_cy = (max_wy / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+        let _min_cx = (min_wx / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+        let _min_cy = (min_wy / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+        let _max_cx = (max_wx / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
+        let _max_cy = (max_wy / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
 
                                     // Removed aggressive chunk generation for Fog of War logic
                                     // Chunks will generate only when units approach them in update()
@@ -1429,21 +1839,88 @@ pub fn run_game() -> Result<(), JsValue> {
                                 y: unit.y,
                                 path: Vec::new(),
                                 selected: false,
-                                kind: 0,
+                                kind: unit.kind,
                                 color,
                                 owner_id: unit.owner_id,
+                                job: UnitJob::Idle,
+                                hp: unit.hp,
                             });
+                            if Some(unit.owner_id) == state.my_id {
+                                state.pop_used += 1;
+                            }
                             log("New unit spawned!");
                         },
                         GameMessage::Build { .. } => {}, // Should not be received by client, but good for completeness
                         GameMessage::BuildingSpawned { building } => {
-                            state.buildings.push(Building {
-                                tile_x: building.tile_x,
-                                tile_y: building.tile_y,
-                                kind: building.kind,
-                                owner_id: building.owner_id
-                            });
+                        state.buildings.push(Building {
+                            id: building.id,
+                            tile_x: building.tile_x,
+                            tile_y: building.tile_y,
+                            kind: building.kind,
+                            owner_id: building.owner_id,
+                            hp: building.hp,
+                        });
+                            if Some(building.owner_id) == state.my_id && building.kind == BuildKind::House.to_kind_id() {
+                                state.pop_cap += 1;
+                            }
+                            // Clear progress for that tile
+                            state.server_progress.remove(&(building.tile_x, building.tile_y));
                             log("New building spawned!");
+                        },
+                        GameMessage::BuildProgress { tile_x, tile_y, kind: _, progress } => {
+                            state.server_progress.insert((tile_x, tile_y), TileProgress { progress });
+                        },
+                        GameMessage::UnitHp { owner_id, unit_idx, hp } => {
+                            let mut count = 0;
+                            for u in &mut state.units {
+                                if u.owner_id == owner_id {
+                                    if count == unit_idx {
+                                        u.hp = hp;
+                                        break;
+                                    }
+                                    count += 1;
+                                }
+                            }
+                        },
+                        GameMessage::BuildingHp { tile_x, tile_y, hp } => {
+                            for b in &mut state.buildings {
+                                if b.tile_x == tile_x && b.tile_y == tile_y {
+                                    b.hp = hp;
+                                    break;
+                                }
+                            }
+                        },
+                        GameMessage::ResourceUpdate { player_id, resources, pop_cap, pop_used } => {
+                            if Some(player_id) == state.my_id {
+                                state.resources = resources;
+                                state.pop_cap = pop_cap;
+                                state.pop_used = pop_used;
+                            }
+                        },
+                        GameMessage::TowerShot { x1, y1, x2, y2 } => {
+                            state.tower_shots.push(TowerShot { x1, y1, x2, y2, ttl: 0.3 });
+                        },
+                        GameMessage::UnitDied { owner_id, unit_idx } => {
+                            let mut count = 0;
+                            let mut remove: Option<usize> = None;
+                            for (i, u) in state.units.iter().enumerate() {
+                                if u.owner_id == owner_id {
+                                    if count == unit_idx {
+                                        remove = Some(i);
+                                        break;
+                                    }
+                                    count += 1;
+                                }
+                            }
+                            if let Some(i) = remove {
+                                state.units.remove(i);
+                            }
+                        },
+                        GameMessage::TrainUnit { .. } => {},
+                        GameMessage::AssignGather { .. } => {},
+                        GameMessage::BuildingDestroyed { tile_x, tile_y } => {
+                            state.buildings.retain(|b| !(b.tile_x == tile_x && b.tile_y == tile_y));
+                            state.server_progress.remove(&(tile_x, tile_y));
                         }
                     }
                 }
@@ -1789,7 +2266,42 @@ pub fn run_game() -> Result<(), JsValue> {
                 buffer.rect(base_x + sq + g, base_y, sq, sq, c2.0, c2.1, c2.2);
                 buffer.rect(base_x, base_y + sq + g, sq, sq, c2.0, c2.1, c2.2);
                 buffer.rect(base_x + sq + g, base_y + sq + g, sq, sq, c1.0, c1.1, c1.2);
+            } else if b.kind == BuildKind::Farm.to_kind_id() {
+                let size = tile_size;
+                buffer.rect(sx as i32, sy as i32, size as i32, size as i32, 60, 130, 60);
+                buffer.rect((sx + size * 0.1) as i32, (sy + size * 0.4) as i32, (size * 0.8) as i32, (size * 0.3) as i32, 139, 69, 19);
+            } else if b.kind == BuildKind::House.to_kind_id() {
+                let size = tile_size;
+                buffer.rect(sx as i32, sy as i32, size as i32, size as i32, 210, 190, 140);
+                buffer.rect_outline((sx + 2.0) as i32, (sy + 2.0) as i32, (size - 4.0) as i32, (size - 4.0) as i32, 160, 120, 80);
+                buffer.rect((sx + size * 0.35) as i32, (sy + size * 0.4) as i32, (size * 0.3) as i32, (size * 0.35) as i32, 120, 70, 40);
+            } else if b.kind == BuildKind::Tower.to_kind_id() {
+                let size = tile_size;
+                buffer.rect((sx + size * 0.2) as i32, (sy + size * 0.1) as i32, (size * 0.6) as i32, (size * 0.8) as i32, 140, 140, 160);
+                buffer.rect((sx + size * 0.3) as i32, (sy + size * 0.05) as i32, (size * 0.4) as i32, (size * 0.1) as i32, 100, 100, 120);
+                buffer.rect((sx + size * 0.35) as i32, (sy + size * 0.5) as i32, (size * 0.3) as i32, (size * 0.3) as i32, 200, 200, 220);
+            } else if b.kind == BuildKind::Barracks.to_kind_id() {
+                let size = tile_size;
+                buffer.rect(sx as i32, sy as i32, size as i32, size as i32, 160, 80, 80);
+                buffer.rect((sx + size * 0.1) as i32, (sy + size * 0.6) as i32, (size * 0.8) as i32, (size * 0.25) as i32, 120, 60, 60);
+                buffer.rect((sx + size * 0.35) as i32, (sy + size * 0.3) as i32, (size * 0.3) as i32, (size * 0.25) as i32, 200, 200, 200);
             }
+
+            // Health bar for buildings
+            let max_hp = match b.kind {
+                0 => TOWN_HP,
+                1 => WALL_HP,
+                2 => FARM_HP,
+                3 => HOUSE_HP,
+                4 => TOWER_HP,
+                5 => BARRACKS_HP,
+                _ => 200.0,
+            };
+            let hp_ratio = (b.hp / max_hp).clamp(0.0, 1.0);
+            let bar_w = tile_size;
+            let filled = (bar_w * hp_ratio) as i32;
+            buffer.rect(sx as i32, (sy - 6.0) as i32, bar_w as i32, 4, 60, 20, 20);
+            buffer.rect(sx as i32, (sy - 6.0) as i32, filled, 4, 0, 200, 0);
         }
         
         // --- WALL PREVIEW (transparent blue) ---
@@ -1801,7 +2313,7 @@ pub fn run_game() -> Result<(), JsValue> {
                 let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
                 let sy = (tile_world_y - cam_y) * zoom + screen_center_y;
                 let size = tile_size;
-                let half = (size / 2.0).floor();
+            let _half = (size / 2.0).floor();
                 let gap = 1.0_f32.max(size * 0.05);
                 let sq = ((size - gap) / 2.0).floor() as i32;
                 let base_x = sx as i32;
@@ -1835,6 +2347,28 @@ pub fn run_game() -> Result<(), JsValue> {
             }
         }
 
+        // --- BUILD PROGRESS BARS (server-driven) ---
+        for ((tx, ty), prog) in &gs.server_progress {
+            let tile_world_x = *tx as f32 * TILE_SIZE_BASE;
+            let tile_world_y = *ty as f32 * TILE_SIZE_BASE;
+            let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
+            let sy = (tile_world_y - cam_y) * zoom + screen_center_y;
+            let bar_w = tile_size;
+            let bar_h = 4.0;
+            let filled = (bar_w * prog.progress.clamp(0.0, 1.0)) as i32;
+            buffer.rect((sx) as i32, (sy - 6.0) as i32, bar_w as i32, bar_h as i32, 40, 40, 40);
+            buffer.rect((sx) as i32, (sy - 6.0) as i32, filled, bar_h as i32, 0, 200, 0);
+        }
+
+        // Tower shots
+        for shot in &gs.tower_shots {
+            let sx1 = (shot.x1 - cam_x) * zoom + screen_center_x;
+            let sy1 = (shot.y1 - cam_y) * zoom + screen_center_y;
+            let sx2 = (shot.x2 - cam_x) * zoom + screen_center_x;
+            let sy2 = (shot.y2 - cam_y) * zoom + screen_center_y;
+            buffer.line(sx1 as i32, sy1 as i32, sx2 as i32, sy2 as i32, 255, 200, 50, false);
+        }
+
         // Render Units
         for u in &gs.units {
             let sx = (u.x - cam_x) * zoom + screen_center_x;
@@ -1866,7 +2400,18 @@ pub fn run_game() -> Result<(), JsValue> {
                     buffer.rect_outline((sx - box_size/2.0) as i32, (sy - box_size/2.0) as i32, box_size as i32, box_size as i32, 0, 255, 0);
                 }
                 
-                buffer.rect(unit_draw_x as i32, unit_draw_y as i32, w as i32, w as i32, u.color.0, u.color.1, u.color.2);
+                let mut draw_color = u.color;
+                if u.kind == UnitKind::Warrior.to_u8() {
+                    draw_color = (255, 215, 0);
+                }
+                buffer.rect(unit_draw_x as i32, unit_draw_y as i32, w as i32, w as i32, draw_color.0, draw_color.1, draw_color.2);
+
+                // Health bar
+                let hp_ratio = (u.hp / if u.kind == UnitKind::Warrior.to_u8() { WARRIOR_HP } else { WORKER_HP }).clamp(0.0, 1.0);
+                let bar_w = w;
+                let filled = (bar_w * hp_ratio) as i32;
+                buffer.rect((unit_draw_x) as i32, (unit_draw_y - 4.0) as i32, bar_w as i32, 3, 60, 20, 20);
+                buffer.rect((unit_draw_x) as i32, (unit_draw_y - 4.0) as i32, filled, 3, 0, 200, 0);
             }
         }
 
@@ -1874,8 +2419,27 @@ pub fn run_game() -> Result<(), JsValue> {
         buffer.rect(0, 0, WIDTH as i32, 30, 50, 50, 50);
         
         // Minimap/Status
-        let status_color = if gs.my_id.is_some() { (0, 255, 0) } else { (100, 100, 100) };
+        let status_color = match gs.ws_state {
+            WsState::Connected => (0, 200, 0),
+            WsState::Connecting => (220, 180, 0),
+            WsState::Error => (220, 0, 0),
+            WsState::Closed => (120, 120, 120),
+        };
         buffer.rect(10, 10, 10, 10, status_color.0, status_color.1, status_color.2);
+
+        // Simple resource bars (Wood, Stone, Gold, Food)
+        let res = gs.resources;
+        let bar_x = 30;
+        let bar_y = 6;
+        let max_width = 120.0;
+        let wood_w = (res.wood / 2.0).min(max_width) as i32;
+        let stone_w = (res.stone / 2.0).min(max_width) as i32;
+        let gold_w = (res.gold / 2.0).min(max_width) as i32;
+        let food_w = (res.food / 2.0).min(max_width) as i32;
+        buffer.rect(bar_x, bar_y, wood_w, 4, 139, 69, 19);
+        buffer.rect(bar_x, bar_y + 6, stone_w, 4, 120, 120, 120);
+        buffer.rect(bar_x, bar_y + 12, gold_w, 4, 255, 215, 0);
+        buffer.rect(bar_x, bar_y + 18, food_w, 4, 34, 139, 34);
 
         // Display other players (Red Dots) - Still useful for debugging
         for p in &gs.other_players {
@@ -1885,10 +2449,10 @@ pub fn run_game() -> Result<(), JsValue> {
              let px = (cx as f32 * CHUNK_SIZE as f32 * TILE_SIZE_BASE) + (CHUNK_SIZE as f32 * TILE_SIZE_BASE / 2.0);
              let py = (cy as f32 * CHUNK_SIZE as f32 * TILE_SIZE_BASE) + (CHUNK_SIZE as f32 * TILE_SIZE_BASE / 2.0);
              
-             let sx = (px - cam_x) * zoom + screen_center_x;
-             let sy = (py - cam_y) * zoom + screen_center_y;
-             
-             let size = tile_size * 0.8;
+            let _sx = (px - cam_x) * zoom + screen_center_x;
+            let _sy = (py - cam_y) * zoom + screen_center_y;
+            
+            let _size = tile_size * 0.8;
              // buffer.rect((sx - size/2.0) as i32, (sy - size/2.0) as i32, size as i32, size as i32, 255, 0, 0);
         }
         
@@ -1923,29 +2487,71 @@ pub fn run_game() -> Result<(), JsValue> {
 
         // Action Button (Left) - Context-dependent
         if let Some(b_idx) = gs.selected_building {
-             if b_idx < gs.buildings.len() && Some(gs.buildings[b_idx].owner_id) == gs.my_id && gs.buildings[b_idx].kind == 0 {
-                 // Spawn Worker Button
-                 buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
-                 // Plus icon
-                 buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, 0, 255, 0);
-                 buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, 0, 255, 0);
+             if b_idx < gs.buildings.len() && Some(gs.buildings[b_idx].owner_id) == gs.my_id {
+                if gs.buildings[b_idx].kind == 0 {
+                     // Spawn Worker Button
+                     buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
+                     // Plus icon
+                     buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, 0, 255, 0);
+                     buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, 0, 255, 0);
+                 } else if gs.buildings[b_idx].kind == BuildKind::Barracks.to_kind_id() {
+                     // Train Warrior Button
+                     buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 120, 40, 40);
+                     buffer.rect(18, (home_btn_y + 10.0) as i32, 24, 6, 255, 255, 255);
+                     buffer.rect(20, (home_btn_y + 16.0) as i32, 6, 18, 255, 255, 255);
+                     buffer.rect(32, (home_btn_y + 16.0) as i32, 6, 18, 255, 255, 255);
+                 }
              }
         } else {
             let any_unit_selected = gs.units.iter().any(|u| u.selected && Some(u.owner_id) == gs.my_id);
             if any_unit_selected {
-                 // Build Wall Button - changes color when build mode active
-                 let build_color = if gs.build_mode { (0, 200, 0) } else { (0, 0, 150) };
+                 // Build button opens submenu
+                 let build_color = if gs.build_menu_open { (0, 200, 0) } else { (0, 0, 150) };
                  buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, build_color.0, build_color.1, build_color.2);
-                 // Centered 2x2 brick icon (10x10 squares with 4px gap)
-                 let sq = 10; // square size
-                 let gap = 4;
-                 let grid_size = sq * 2 + gap; // 24
-                 let offset_x = 10 + ((btn_size as i32 - grid_size) / 2); // center horizontally
-                 let offset_y = home_btn_y as i32 + ((btn_size as i32 - grid_size) / 2); // center vertically
-                 buffer.rect(offset_x, offset_y, sq, sq, 150, 150, 150);
-                 buffer.rect(offset_x + sq + gap, offset_y, sq, sq, 130, 130, 130);
-                 buffer.rect(offset_x, offset_y + sq + gap, sq, sq, 130, 130, 130);
-                 buffer.rect(offset_x + sq + gap, offset_y + sq + gap, sq, sq, 150, 150, 150);
+                 // Plus icon
+                 buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, 0, 255, 0);
+                 buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, 0, 255, 0);
+
+                 if gs.build_menu_open {
+                     let options = [
+                         (BuildKind::Wall, (150, 150, 150)),
+                         (BuildKind::Farm, (50, 120, 50)),
+                         (BuildKind::House, (200, 180, 120)),
+                         (BuildKind::Tower, (120, 120, 140)),
+                         (BuildKind::Barracks, (180, 80, 80)),
+                     ];
+                     for (idx, (kind, color)) in options.iter().enumerate() {
+                         let opt_y = home_btn_y - ((idx as f32 + 1.0) * (btn_size + 6.0));
+                         let affordable = gs.resources.has(&kind.cost());
+                         let draw_color = if affordable { *color } else { (color.0 / 2, color.1 / 2, color.2 / 2) };
+                         buffer.rect(10, opt_y as i32, btn_size as i32, btn_size as i32, draw_color.0, draw_color.1, draw_color.2);
+                         // Tiny icon per type
+                         match kind {
+                             BuildKind::Wall => {
+                                 buffer.rect(16, (opt_y + 8.0) as i32, 8, 8, 200, 200, 200);
+                                 buffer.rect(28, (opt_y + 8.0) as i32, 8, 8, 180, 180, 180);
+                                 buffer.rect(16, (opt_y + 20.0) as i32, 8, 8, 180, 180, 180);
+                                 buffer.rect(28, (opt_y + 20.0) as i32, 8, 8, 200, 200, 200);
+                             },
+                             BuildKind::Farm => {
+                                 buffer.rect(18, (opt_y + 10.0) as i32, 24, 12, 80, 160, 80);
+                                 buffer.rect(18, (opt_y + 22.0) as i32, 24, 4, 139, 69, 19);
+                             },
+                             BuildKind::House => {
+                                 buffer.rect(18, (opt_y + 16.0) as i32, 20, 12, 220, 200, 140);
+                                 buffer.rect(16, (opt_y + 12.0) as i32, 24, 6, 180, 150, 100);
+                             },
+                             BuildKind::Tower => {
+                                 buffer.rect(22, (opt_y + 10.0) as i32, 16, 20, 160, 160, 180);
+                                 buffer.rect(24, (opt_y + 6.0) as i32, 12, 4, 120, 120, 140);
+                             },
+                             BuildKind::Barracks => {
+                                 buffer.rect(18, (opt_y + 12.0) as i32, 24, 14, 190, 90, 90);
+                                 buffer.rect(18, (opt_y + 10.0) as i32, 24, 4, 120, 60, 60);
+                             },
+                         }
+                     }
+                 }
             }
         }
         
@@ -2003,7 +2609,7 @@ pub fn run_game() -> Result<(), JsValue> {
             
             // If more than max, show "+N"
             if selected_units.len() > max_display {
-                let extra = selected_units.len() - max_display;
+                let _extra = selected_units.len() - max_display;
                 let text_x = 10.0 + (max_display as f32 * (unit_icon_size + 4.0));
                 // Simple "+N" indicator (just a small box with different color)
                 buffer.rect(text_x as i32, icons_y as i32, unit_icon_size as i32, unit_icon_size as i32, 100, 100, 100);

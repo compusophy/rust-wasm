@@ -1,10 +1,12 @@
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{timeout, Duration};
 use futures_util::{StreamExt, SinkExt};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use std::env;
 use tokio::sync::broadcast;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use sqlx::postgres::PgPoolOptions;
@@ -22,6 +24,8 @@ struct PlayerInfo {
 struct UnitState {
     x: f32,
     y: f32,
+    hp: f32,
+    kind: u8,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -30,6 +34,8 @@ struct UnitDTO {
     unit_idx: usize,
     x: f32,
     y: f32,
+    kind: u8,
+    hp: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -39,25 +45,116 @@ struct BuildingDTO {
     kind: u8,
     tile_x: i32,
     tile_y: i32,
+    hp: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 enum GameMessage {
     Join { version: u32, token: Option<String> },
-    Welcome { player_id: i32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo>, units: Vec<UnitDTO>, buildings: Vec<BuildingDTO>, token: String },
+    Welcome { player_id: i32, chunk_x: i32, chunk_y: i32, players: Vec<PlayerInfo>, units: Vec<UnitDTO>, buildings: Vec<BuildingDTO>, token: String, resources: Resources, pop_cap: i32, pop_used: i32 },
     NewPlayer { player: PlayerInfo },
     UnitMove { player_id: i32, unit_idx: usize, x: f32, y: f32 },
     UnitSync { player_id: i32, unit_idx: usize, x: f32, y: f32 },
     SpawnUnit,
+    TrainUnit { building_id: i32, kind: u8 },
     UnitSpawned { unit: UnitDTO },
     Build { kind: u8, tile_x: i32, tile_y: i32 },
+    BuildProgress { tile_x: i32, tile_y: i32, kind: u8, progress: f32 },
     BuildingSpawned { building: BuildingDTO },
+    AssignGather { unit_ids: Vec<usize>, target_x: i32, target_y: i32, kind: u8 },
+    TowerShot { x1: f32, y1: f32, x2: f32, y2: f32 },
+    UnitDied { owner_id: i32, unit_idx: usize },
+    BuildingDestroyed { tile_x: i32, tile_y: i32 },
+    UnitHp { owner_id: i32, unit_idx: usize, hp: f32 },
+    BuildingHp { tile_x: i32, tile_y: i32, hp: f32 },
+    ResourceUpdate { player_id: i32, resources: Resources, pop_cap: i32, pop_used: i32 },
     Error { message: String },
 }
 
 // Default fallback, but DB overrides this
-const MIN_CLIENT_VERSION_DEFAULT: u32 = 16;
+const MIN_CLIENT_VERSION_DEFAULT: u32 = 22;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+struct Resources {
+    wood: f32,
+    stone: f32,
+    gold: f32,
+    food: f32,
+}
+
+impl Resources {
+    fn new(wood: f32, stone: f32, gold: f32, food: f32) -> Self {
+        Resources { wood, stone, gold, food }
+    }
+    fn has(&self, cost: &Resources) -> bool {
+        self.wood >= cost.wood && self.stone >= cost.stone && self.gold >= cost.gold && self.food >= cost.food
+    }
+    fn spend(&mut self, cost: &Resources) -> bool {
+        if self.has(cost) {
+            self.wood -= cost.wood;
+            self.stone -= cost.stone;
+            self.gold -= cost.gold;
+            self.food -= cost.food;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+const COST_WALL: Resources = Resources { wood: 1.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_FARM: Resources = Resources { wood: 30.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_HOUSE: Resources = Resources { wood: 25.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_TOWER: Resources = Resources { wood: 0.0, stone: 40.0, gold: 0.0, food: 0.0 };
+const COST_BARRACKS: Resources = Resources { wood: 60.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_WORKER: Resources = Resources { wood: 0.0, stone: 0.0, gold: 0.0, food: 50.0 };
+const COST_WARRIOR: Resources = Resources { wood: 0.0, stone: 0.0, gold: 20.0, food: 40.0 };
+
+const FARM_FOOD_PER_SEC: f32 = 10.0 / 60.0;
+const TREE_WOOD_PER_SEC: f32 = 8.0 / 60.0;
+const STONE_PER_SEC: f32 = 6.0 / 60.0;
+const GOLD_PER_SEC: f32 = 6.0 / 60.0;
+const WORKER_HP: f32 = 50.0;
+const WARRIOR_HP: f32 = 120.0;
+const TOWN_HP: f32 = 800.0;
+const WALL_HP: f32 = 200.0;
+const TOWER_HP: f32 = 300.0;
+const FARM_HP: f32 = 220.0;
+const HOUSE_HP: f32 = 220.0;
+const BARRACKS_HP: f32 = 260.0;
+const TOWER_DAMAGE: f32 = 25.0;
+const WARRIOR_RANGE: f32 = 48.0;
+const WARRIOR_DPS: f32 = 30.0;
+const POP_FROM_HOUSE: i32 = 1;
+const TILE_SIZE: f32 = 16.0;
+
+fn cost_for_kind(kind: u8) -> Resources {
+    match kind {
+        1 => COST_WALL,
+        2 => COST_FARM,
+        3 => COST_HOUSE,
+        4 => COST_TOWER,
+        5 => COST_BARRACKS,
+        _ => Resources::new(0.0, 0.0, 0.0, 0.0),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BuildTask {
+    owner_id: i32,
+    kind: u8,
+    tile_x: i32,
+    tile_y: i32,
+    progress: f32,
+}
+
+#[derive(Clone, Copy)]
+struct GatherTask {
+    kind: u8,
+    target_x: i32,
+    target_y: i32,
+}
 
 struct GlobalState {
     next_id: i32,
@@ -65,6 +162,11 @@ struct GlobalState {
     units: HashMap<i32, Vec<UnitState>>,
     // Memory mode persistence (Token -> PlayerID)
     tokens: HashMap<String, i32>, 
+    resources: HashMap<i32, Resources>,
+    pop_cap: HashMap<i32, i32>,
+    building_progress: HashMap<(i32, i32), BuildTask>, // (tile_x, tile_y) -> task
+    gather_tasks: HashMap<(i32, usize), GatherTask>, // (owner_id, unit_idx)
+    buildings: Vec<BuildingDTO>,
 }
 
 impl GlobalState {
@@ -74,6 +176,11 @@ impl GlobalState {
             players: HashMap::new(),
             units: HashMap::new(),
             tokens: HashMap::new(),
+            resources: HashMap::new(),
+            pop_cap: HashMap::new(),
+            building_progress: HashMap::new(),
+            gather_tasks: HashMap::new(),
+            buildings: Vec::new(),
         }
     }
 
@@ -142,14 +249,48 @@ impl GlobalState {
         // Unit positions: offset from Town Center's top-left
         // Place them 2 tiles below the TC, spread horizontally
         vec![
-            UnitState { x: tc_world_x + tile_size * 0.5, y: tc_world_y + tile_size * 2.0 },
-            UnitState { x: tc_world_x + tile_size * 1.5, y: tc_world_y + tile_size * 2.0 },
+            UnitState { x: tc_world_x + tile_size * 0.5, y: tc_world_y + tile_size * 2.0, hp: WORKER_HP, kind: 0 },
+            UnitState { x: tc_world_x + tile_size * 1.5, y: tc_world_y + tile_size * 2.0, hp: WORKER_HP, kind: 0 },
         ]
     }
+
+    fn find_building(&self, owner: i32, id: i32) -> Option<BuildingDTO> {
+        self.buildings.iter().find(|b| b.owner_id == owner && b.id == id).cloned()
+    }
+
+    fn is_tile_blocked(&self, tx: i32, ty: i32) -> bool {
+        // Block if building already present
+        if self.buildings.iter().any(|b| b.tile_x == tx && b.tile_y == ty) {
+            return true;
+        }
+        // Block if a unit is standing on tile
+        for units in self.units.values() {
+            for u in units {
+                let utx = (u.x / TILE_SIZE).floor() as i32;
+                let uty = (u.y / TILE_SIZE).floor() as i32;
+                if utx == tx && uty == ty {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn default_resources() -> Resources {
+    Resources::new(150.0, 60.0, 60.0, 100.0)
+}
+
+fn default_pop_cap() -> i32 {
+    5
 }
 
 #[tokio::main]
 async fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        println!("CRITICAL PANIC: {:?}", info);
+    }));
+
     let port = env::var("PORT").unwrap_or_else(|_| "9001".to_string());
     let addr = format!("0.0.0.0:{}", port);
     
@@ -234,8 +375,398 @@ async fn main() {
     let (tx, _rx) = broadcast::channel(100);
     let state = Arc::new(Mutex::new(GlobalState::new()));
 
+    // Build progress tick loop (server authoritative)
+    {
+        let tx_clone = tx.clone();
+        let state_clone = state.clone();
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+            let mut tick_count: u64 = 0;
+            loop {
+                interval.tick().await;
+                tick_count += 1;
+                if tick_count % 150 == 0 {
+                    let pool_stats = if let Some(p) = &pool_clone {
+                        format!("DB: {}/{}", p.num_idle(), p.size())
+                    } else {
+                        "DB: None".to_string()
+                    };
+                    println!("Game Loop Alive. Tick: {}. {}", tick_count, pool_stats);
+                } else if tick_count % 10 == 0 {
+                    // Low-frequency heartbeat to confirm it's not stuck
+                    // println!("[TRACE] Tick {}", tick_count); 
+                }
+
+                let mut to_spawn: Vec<BuildTask> = Vec::new();
+                let mut resource_updates: Vec<(i32, Resources, i32, i32)> = Vec::new();
+                let mut shots: Vec<(f32, f32, f32, f32, i32)> = Vec::new(); // shot with owner
+                let mut unit_hp_updates: Vec<(i32, usize, f32)> = Vec::new();
+                let mut unit_deaths: Vec<(i32, usize)> = Vec::new();
+                let mut pop_updates: Vec<i32> = Vec::new(); // owners needing pop recount
+                let mut building_hp_updates: Vec<(i32, i32, f32)> = Vec::new();
+                let mut building_deaths: Vec<(i32, i32, i32)> = Vec::new(); // tile_x, tile_y, owner
+
+                // Snapshot phase
+                let gather_tasks: Vec<(i32, GatherTask)>;
+                let units_snapshot: Vec<(i32, usize, f32, f32, u8)>;
+                let buildings_snapshot: Vec<(usize, i32, i32, i32, f32, u8)>;
+                let towers_snapshot: Vec<(i32, f32, f32)>;
+                {
+                    // Use try_lock to detect contention
+                    if let Ok(mut gs) = state_clone.try_lock() {
+                        // println!("[TRACE] Tick {} Locked", tick_count);
+                        let mut finished = Vec::new();
+                        for (key, task) in gs.building_progress.iter_mut() {
+                            task.progress += 0.12; // ~1.6s build; adjust as needed
+                        // Ignored result to avoid panic on empty receivers
+                        let _ = tx_clone.send(serde_json::to_string(&GameMessage::BuildProgress {
+                            tile_x: task.tile_x,
+                            tile_y: task.tile_y,
+                            kind: task.kind,
+                            progress: task.progress.min(1.0),
+                        }).unwrap_or_default());
+                        if task.progress >= 1.0 {
+                                finished.push(*key);
+                                to_spawn.push(*task);
+                            }
+                        }
+                        for k in finished {
+                            gs.building_progress.remove(&k);
+                        }
+                        gather_tasks = gs.gather_tasks.iter().map(|((owner, _), g)| (*owner, *g)).collect();
+                        units_snapshot = gs.units.iter()
+                            .flat_map(|(owner, us)| us.iter().enumerate().map(move |(i, u)| (*owner, i, u.x, u.y, u.kind)))
+                            .collect();
+                        buildings_snapshot = gs.buildings.iter().enumerate()
+                            .map(|(i, b)| (i, b.owner_id, b.tile_x, b.tile_y, b.hp, b.kind))
+                            .collect();
+                        towers_snapshot = gs.buildings.iter()
+                            .filter(|b| b.kind == 4)
+                            .map(|b| (b.owner_id, b.tile_x as f32 * 16.0 + 8.0, b.tile_y as f32 * 16.0 + 8.0))
+                            .collect();
+                        // println!("[TRACE] Tick {} Snapshot Done", tick_count);
+                    } else {
+                        // println!("[WARN] MainLoop skipped tick - Lock contention");
+                        continue; // Skip this tick if locked
+                    }
+                }
+
+                // println!("[TRACE] Tick {} Processing", tick_count);
+
+                // Gathering tick
+                for (owner, gtask) in gather_tasks {
+                    let mut gs = state_clone.lock().await;
+                    {
+                        let entry = gs.resources.entry(owner).or_insert(default_resources());
+                        match gtask.kind {
+                            2 => entry.wood += TREE_WOOD_PER_SEC * 0.2,
+                            3 => entry.stone += STONE_PER_SEC * 0.2,
+                            4 => entry.gold += GOLD_PER_SEC * 0.2,
+                            _ => entry.food += FARM_FOOD_PER_SEC * 0.2, // farm
+                        }
+                    }
+                    let res_snapshot = *gs.resources.get(&owner).unwrap_or(&default_resources());
+                    let pop_cap = *gs.pop_cap.get(&owner).unwrap_or(&default_pop_cap());
+                    let pop_used = gs.units.get(&owner).map(|u| u.len() as i32).unwrap_or(0);
+                    resource_updates.push((owner, res_snapshot, pop_cap, pop_used));
+                }
+
+                // Warrior targeting using snapshots
+                let mut unit_damage: Vec<(i32, usize, f32)> = Vec::new();
+                let mut building_damage: Vec<(usize, f32)> = Vec::new();
+                for (owner, _idx, ux, uy, kind) in &units_snapshot {
+                    if *kind != 1 { continue; }
+                    let mut best_unit: Option<(i32, usize, f32)> = None;
+                    for (opid, oidx, ox, oy, _ok) in &units_snapshot {
+                        if *opid == *owner { continue; }
+                        let dx = ox - ux;
+                        let dy = oy - uy;
+                        let dist = (dx*dx + dy*dy).sqrt();
+                        if dist < WARRIOR_RANGE && (best_unit.is_none() || dist < best_unit.unwrap().2) {
+                            best_unit = Some((*opid, *oidx, dist));
+                        }
+                    }
+                    if let Some((opid, oidx, _)) = best_unit {
+                        unit_damage.push((opid, oidx, WARRIOR_DPS * 0.2));
+                        continue;
+                    }
+                    let mut best_build: Option<(usize, f32)> = None;
+                    for (bidx, bowner, bx, by, _bhp, _bkind) in &buildings_snapshot {
+                        if *bowner == *owner { continue; }
+                        let dx = *bx as f32 * 16.0 + 8.0 - ux;
+                        let dy = *by as f32 * 16.0 + 8.0 - uy;
+                        let dist = (dx*dx + dy*dy).sqrt();
+                        if dist < WARRIOR_RANGE && (best_build.is_none() || dist < best_build.unwrap().1) {
+                            best_build = Some((*bidx, dist));
+                        }
+                    }
+                    if let Some((bidx, _)) = best_build {
+                        building_damage.push((bidx, WARRIOR_DPS * 0.2));
+                    }
+                }
+
+                // Apply warrior damage
+                {
+                    let mut gs = state_clone.lock().await;
+                    if !unit_damage.is_empty() {
+                        unit_damage.sort_by_key(|(_, idx, _)| std::cmp::Reverse(*idx));
+                        for (pid, idx, dmg) in unit_damage {
+                            if let Some(us) = gs.units.get_mut(&pid) {
+                                if idx < us.len() {
+                                    let u = &mut us[idx];
+                                    u.hp -= dmg;
+                                    if u.hp <= 0.0 {
+                                        us.remove(idx);
+                                        unit_deaths.push((pid, idx));
+                                        pop_updates.push(pid);
+                                    } else {
+                                        unit_hp_updates.push((pid, idx, u.hp));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !building_damage.is_empty() {
+                        building_damage.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
+                        for (bidx, dmg) in building_damage {
+                            if bidx < gs.buildings.len() {
+                                let b = &mut gs.buildings[bidx];
+                                b.hp -= dmg;
+                                if b.hp <= 0.0 {
+                                    let dead = gs.buildings.remove(bidx);
+                                    building_deaths.push((dead.tile_x, dead.tile_y, dead.owner_id));
+                                    if dead.kind == 3 {
+                                        let cap = gs.pop_cap.entry(dead.owner_id).or_insert(default_pop_cap());
+                                        *cap = (*cap - POP_FROM_HOUSE).max(default_pop_cap());
+                                    }
+                                } else {
+                                    building_hp_updates.push((b.tile_x, b.tile_y, b.hp));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Tower shots using snapshots
+                for (owner, tx, ty) in towers_snapshot {
+                    let mut best: Option<(f32, f32, f32)> = None; // dist, x, y
+                    for (pid, _idx, ux, uy, _kind) in &units_snapshot {
+                        if pid == &owner { continue; }
+                        let dx = ux - tx;
+                        let dy = uy - ty;
+                        let dist = (dx*dx + dy*dy).sqrt();
+                        if dist < 120.0 {
+                            if best.map_or(true, |(bd, _, _)| dist < bd) {
+                                best = Some((dist, *ux, *uy));
+                            }
+                        }
+                    }
+                    if let Some((_d, txp, typ)) = best {
+                        shots.push((tx, ty, txp, typ, owner));
+                    }
+                }
+
+                for task in to_spawn {
+                    // Persist and broadcast building spawn
+                    let id;
+                    if let Some(p) = &pool_clone {
+                        let rec = sqlx::query("INSERT INTO buildings (owner_id, kind, tile_x, tile_y) VALUES ($1, $2, $3, $4) RETURNING id")
+                            .bind(task.owner_id)
+                            .bind(task.kind as i32)
+                            .bind(task.tile_x)
+                            .bind(task.tile_y)
+                            .fetch_one(p)
+                            .await;
+                        if let Ok(r) = rec {
+                            id = r.get("id");
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        id = rand::random::<i32>().abs();
+                    }
+
+                    let msg = GameMessage::BuildingSpawned {
+                        building: BuildingDTO {
+                            id,
+                            owner_id: task.owner_id,
+                            kind: task.kind,
+                            tile_x: task.tile_x,
+                            tile_y: task.tile_y,
+                            hp: match task.kind {
+                                0 => TOWN_HP,
+                                1 => WALL_HP,
+                                2 => FARM_HP,
+                                3 => HOUSE_HP,
+                                4 => TOWER_HP,
+                                5 => BARRACKS_HP,
+                                _ => 200.0,
+                            },
+                        }
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = tx_clone.send(json);
+                    }
+
+                    // Cache building
+                            let mut gs = state_clone.lock().await;
+                            gs.buildings.push(BuildingDTO {
+                                id,
+                                owner_id: task.owner_id,
+                                kind: task.kind,
+                                tile_x: task.tile_x,
+                                tile_y: task.tile_y,
+                                hp: match task.kind {
+                                    0 => TOWN_HP,
+                                    1 => WALL_HP,
+                                    2 => FARM_HP,
+                                    3 => HOUSE_HP,
+                                    4 => TOWER_HP,
+                                    5 => BARRACKS_HP,
+                                    _ => 200.0,
+                                },
+                            });
+                }
+
+                for (pid, res, cap, used) in resource_updates {
+                    if let Ok(json) = serde_json::to_string(&GameMessage::ResourceUpdate {
+                        player_id: pid,
+                        resources: res,
+                        pop_cap: cap,
+                        pop_used: used,
+                    }) {
+                        let _ = tx_clone.send(json);
+                    }
+                }
+
+                for (pid, idx, hp) in unit_hp_updates {
+                    if let Ok(json) = serde_json::to_string(&GameMessage::UnitHp { owner_id: pid, unit_idx: idx, hp }) {
+                        let _ = tx_clone.send(json);
+                    }
+                }
+                for (pid, idx) in unit_deaths {
+                    if let Ok(json) = serde_json::to_string(&GameMessage::UnitDied { owner_id: pid, unit_idx: idx }) {
+                        let _ = tx_clone.send(json);
+                    }
+                    pop_updates.push(pid);
+                }
+                // Broadcast pop/resource updates after deaths
+                {
+                    // Use try_lock for pop updates
+                    if let Ok(mut gs) = state_clone.try_lock() {
+                        for owner in pop_updates {
+                            let pop_used = gs.units.get(&owner).map(|u| u.len() as i32).unwrap_or(0);
+                            let pop_cap = *gs.pop_cap.get(&owner).unwrap_or(&default_pop_cap());
+                            let res = *gs.resources.get(&owner).unwrap_or(&default_resources());
+                            if let Ok(json) = serde_json::to_string(&GameMessage::ResourceUpdate {
+                                player_id: owner,
+                                resources: res,
+                                pop_cap,
+                                pop_used,
+                            }) {
+                                let _ = tx_clone.send(json);
+                            }
+                        }
+                    }
+                }
+                for (txi, tyi, hp) in building_hp_updates {
+                    if let Ok(json) = serde_json::to_string(&GameMessage::BuildingHp { tile_x: txi, tile_y: tyi, hp }) {
+                        let _ = tx_clone.send(json);
+                    }
+                }
+                for (txi, tyi, _owner) in building_deaths {
+                    if let Ok(json) = serde_json::to_string(&GameMessage::BuildingDestroyed { tile_x: txi, tile_y: tyi }) {
+                        let _ = tx_clone.send(json);
+                    }
+                }
+
+                for (sx, sy, txp, typ, owner) in shots {
+                    // Apply damage to nearest target (units prioritized)
+                    let mut gs = state_clone.lock().await;
+                    let mut hit_unit: Option<(i32, usize)> = None;
+                    let mut hit_building: Option<usize> = None;
+                    let mut best_dist = 999999.0;
+                    for (pid, units) in gs.units.iter_mut() {
+                        if *pid == owner { continue; }
+                        for (idx, u) in units.iter_mut().enumerate() {
+                            let dx = u.x - txp;
+                            let dy = u.y - typ;
+                            let dist = (dx*dx + dy*dy).sqrt();
+                            if dist < 16.0 && dist < best_dist {
+                                best_dist = dist;
+                                hit_unit = Some((*pid, idx));
+                            }
+                        }
+                    }
+                    if hit_unit.is_none() {
+                        for (idx, b2) in gs.buildings.iter_mut().enumerate() {
+                            let dx = b2.tile_x as f32 * 16.0 + 8.0 - txp;
+                            let dy = b2.tile_y as f32 * 16.0 + 8.0 - typ;
+                            let dist = (dx*dx + dy*dy).sqrt();
+                            if dist < 16.0 && dist < best_dist && b2.owner_id != owner {
+                                best_dist = dist;
+                                hit_building = Some(idx);
+                            }
+                        }
+                    }
+
+                    if let Some((pid, idx)) = hit_unit {
+                        if let Some(units) = gs.units.get_mut(&pid) {
+                            if idx < units.len() {
+                                let u = &mut units[idx];
+                                u.hp -= TOWER_DAMAGE;
+                                if let Ok(json) = serde_json::to_string(&GameMessage::UnitHp { owner_id: pid, unit_idx: idx, hp: u.hp }) {
+                                    let _ = tx_clone.send(json);
+                                }
+                                if u.hp <= 0.0 {
+                                    units.remove(idx);
+                                    let _ = tx_clone.send(serde_json::to_string(&GameMessage::UnitDied { owner_id: pid, unit_idx: idx }).unwrap());
+                                }
+                            }
+                        }
+                    } else if let Some(idx) = hit_building {
+                        if idx < gs.buildings.len() {
+                            let b = &mut gs.buildings[idx];
+                            b.hp -= TOWER_DAMAGE;
+                            if let Ok(json) = serde_json::to_string(&GameMessage::BuildingHp { tile_x: b.tile_x, tile_y: b.tile_y, hp: b.hp }) {
+                                let _ = tx_clone.send(json);
+                            }
+                            if b.hp <= 0.0 {
+                                let dead = gs.buildings.remove(idx);
+                                if let Ok(json) = serde_json::to_string(&GameMessage::BuildingDestroyed { tile_x: dead.tile_x, tile_y: dead.tile_y }) {
+                                    let _ = tx_clone.send(json);
+                                }
+                                if dead.kind == 3 {
+                                    let cap = gs.pop_cap.entry(dead.owner_id).or_insert(default_pop_cap());
+                                    *cap = (*cap - POP_FROM_HOUSE).max(default_pop_cap());
+                                }
+                            }
+                        }
+                    }
+
+                    if let Ok(json) = serde_json::to_string(&GameMessage::TowerShot { x1: sx, y1: sy, x2: txp, y2: typ }) {
+                        let _ = tx_clone.send(json);
+                    }
+                }
+                // println!("[TRACE] Tick {} Done", tick_count);
+            }
+        });
+    }
+
     let listener = TcpListener::bind(&addr).await.expect("Failed to bind");
     println!("Listening on: {}", addr);
+
+    // #region agent log
+    /*
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(r"c:\25\dec-25\temty\.cursor\debug.log") {
+            let _ = writeln!(file, "{{\"timestamp\":{},\"location\":\"server/src/main.rs:main\",\"message\":\"Server started listening\",\"data\":{{\"addr\":\"{}\"}},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), addr);
+        }
+    }
+    */
+    // #endregion agent log
 
     while let Ok((stream, _)) = listener.accept().await {
         let tx = tx.clone();
@@ -251,10 +782,29 @@ async fn handle_connection(
     state: Arc<Mutex<GlobalState>>,
     pool: Option<Pool<Postgres>>
 ) {
-    let ws_stream = match accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            println!("Error during the websocket handshake occurred: {}", e);
+    let peer = stream.peer_addr().ok();
+    println!("Incoming socket from {:?}", peer);
+
+    // #region agent log
+    /*
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(r"c:\25\dec-25\temty\.cursor\debug.log") {
+            let _ = writeln!(file, "{{\"timestamp\":{},\"location\":\"server/src/main.rs:handle_connection\",\"message\":\"Incoming connection\",\"data\":{{\"peer\":\"{:?}\"}},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), peer);
+        }
+    }
+    */
+    // #endregion agent log
+
+    // Short timeout to avoid hanging on plain HTTP probes
+    let ws_stream = match timeout(Duration::from_secs(2), accept_async(stream)).await {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => {
+            println!("Error during the websocket handshake occurred from {:?}: {}", peer, e);
+            return;
+        }
+        Err(_) => {
+            println!("Handshake timeout from {:?}, closing.", peer);
             return;
         }
     };
@@ -267,6 +817,17 @@ async fn handle_connection(
 
     if let Some(Ok(msg)) = read.next().await {
         if let Ok(text) = msg.to_text() {
+            // #region agent log
+            /*
+            {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(r"c:\25\dec-25\temty\.cursor\debug.log") {
+                     let _ = writeln!(file, "{{\"timestamp\":{},\"location\":\"server/src/main.rs:handshake\",\"message\":\"Received handshake text\",\"data\":{{\"text\":\"{}\"}},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"B\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), text.replace("\"", "\\\""));
+                }
+            }
+            */
+            // #endregion agent log
+
             if let Ok(GameMessage::Join { version, token }) = serde_json::from_str(text) {
                 
                 // CHECK VERSION (DB or Fallback)
@@ -286,13 +847,16 @@ async fn handle_connection(
                 };
 
                 if version < required_version {
+                    println!("Rejecting client {:?}: version {} < required {}", peer, version, required_version);
                     let _ = write.send(Message::Text(serde_json::to_string(&GameMessage::Error { 
                         message: format!("Client version {} is too old. Minimum required: {}", version, required_version) 
                     }).unwrap())).await;
                     return;
                 }
                 client_token = token;
+                println!("Accepted handshake from {:?}, version {}", peer, version);
             } else {
+                 println!("Invalid handshake from {:?}: {}", peer, text);
                  let _ = write.send(Message::Text(serde_json::to_string(&GameMessage::Error { 
                         message: "Invalid handshake: expected Join message".to_string() 
                     }).unwrap())).await;
@@ -324,7 +888,7 @@ async fn handle_connection(
         }
     } else {
         // MEMORY MODE (Fallback)
-        let mut gs = state.lock().unwrap();
+        let mut gs = state.lock().await;
         
         // Check if token exists in memory
         if let Some(t) = client_token.as_ref() {
@@ -379,12 +943,12 @@ async fn handle_connection(
                 } else {
                     // Found in DB -> Load
                     let mut loaded = Vec::new();
-                    // We need to ensure they are sorted by index or we just map them. 
-                    // Query was ORDER BY unit_idx, so we are good.
                     for r in unit_rows {
                         loaded.push(UnitState {
                             x: r.get::<f32, _>("x"),
                             y: r.get::<f32, _>("y"),
+                            hp: WORKER_HP,
+                            kind: 0,
                         });
                     }
                     loaded
@@ -406,7 +970,7 @@ async fn handle_connection(
     };
 
     // FETCH ALL PLAYERS & UNITS & BUILDINGS (DB Mode) - To show offline players
-    let (db_players, db_units, db_buildings) = if let Some(p) = &pool {
+    let (mut db_players, mut db_units, mut db_buildings) = if let Some(p) = &pool {
          let p_rows = sqlx::query("SELECT id, chunk_x, chunk_y FROM players").fetch_all(p).await.unwrap_or_default();
          let players: Vec<PlayerInfo> = p_rows.into_iter().map(|r| PlayerInfo {
              id: r.get("id"),
@@ -420,6 +984,8 @@ async fn handle_connection(
              unit_idx: r.get::<i32, _>("unit_idx") as usize,
              x: r.get("x"),
              y: r.get("y"),
+            kind: 0,
+            hp: WORKER_HP,
          }).collect();
          
          let b_rows = sqlx::query("SELECT id, owner_id, kind, tile_x, tile_y FROM buildings").fetch_all(p).await.unwrap_or_default();
@@ -429,6 +995,7 @@ async fn handle_connection(
              kind: r.get::<i32, _>("kind") as u8,
              tile_x: r.get("tile_x"),
              tile_y: r.get("tile_y"),
+             hp: 200.0,
          }).collect();
 
          (Some(players), Some(units), Some(buildings))
@@ -436,11 +1003,44 @@ async fn handle_connection(
         (None, None, None)
     };
 
+    // Ensure Town Center exists for this player (DB mode)
+    if let (Some(ref mut _ps), Some(ref mut _us), Some(ref mut bs)) = (&mut db_players, &mut db_units, &mut db_buildings) {
+        let has_tc = bs.iter().any(|b| b.owner_id == player_id && b.kind == 0);
+        if !has_tc {
+            let tc_tx = chunk_x * 32 + 16;
+            let tc_ty = chunk_y * 32 + 16;
+            if let Some(p) = &pool {
+                if let Ok(rec) = sqlx::query("INSERT INTO buildings (owner_id, kind, tile_x, tile_y) VALUES ($1, $2, $3, $4) RETURNING id")
+                    .bind(player_id)
+                    .bind(0_i32)
+                    .bind(tc_tx)
+                    .bind(tc_ty)
+                    .fetch_one(p)
+                    .await
+                {
+                    let id: i32 = rec.get("id");
+                    bs.push(BuildingDTO { id, owner_id: player_id, kind: 0, tile_x: tc_tx, tile_y: tc_ty, hp: TOWN_HP });
+                }
+            }
+        }
+    }
+
     // Update Global State (Active Players & Units)
     let (all_players, all_units_dto, all_buildings_dto) = {
-        let mut gs = state.lock().unwrap();
+        // Use try_lock loop to avoid blocking the thread if contended
+        // WARNING: Cannot await while holding (or potentially holding in match arm) a MutexGuard!
+        // We must loop and only grab guard when we succeed, immediately using it and breaking.
+        // But we can't break with the guard because we need to use it.
+        // We need to move the yield outside.
+        // Replaced loop with async lock
+        let mut gs = state.lock().await;
+        // println!("[DEBUG] HandleConn Locked");
         
         gs.players.insert(player_id, PlayerInfo { id: player_id, chunk_x, chunk_y });
+
+        // Initialize economy if missing
+        gs.resources.entry(player_id).or_insert(default_resources());
+        gs.pop_cap.entry(player_id).or_insert(default_pop_cap());
         
         // Handle Units
         if pool.is_some() {
@@ -451,6 +1051,22 @@ async fn handle_connection(
             if !gs.units.contains_key(&player_id) {
                 gs.units.insert(player_id, GlobalState::spawn_units(chunk_x, chunk_y));
             }
+        }
+
+        // Ensure Town Center exists (memory mode or cache for DB)
+        let has_tc = gs.buildings.iter().any(|b| b.owner_id == player_id && b.kind == 0);
+        if !has_tc {
+            let tc_tx = chunk_x * 32 + 16;
+            let tc_ty = chunk_y * 32 + 16;
+            let tc = BuildingDTO {
+                id: rand::random::<i32>().abs(),
+                owner_id: player_id,
+                kind: 0,
+                tile_x: tc_tx,
+                tile_y: tc_ty,
+                hp: TOWN_HP,
+            };
+            gs.buildings.push(tc);
         }
         
         if let (Some(ps), Some(us), Some(bs)) = (db_players, db_units, db_buildings) {
@@ -466,17 +1082,44 @@ async fn handle_connection(
                         unit_idx: i,
                         x: u.x,
                         y: u.y,
+                        kind: u.kind,
+                        hp: u.hp,
                     });
                 }
             }
+            let buildings_dto = gs.buildings.clone();
             
-            (existing_players, units_dto, Vec::new())
+            (existing_players, units_dto, buildings_dto)
         }
     };
+
+    // Adjust pop cap for existing houses for this player
+    {
+        let mut gs = state.lock().await;
+        let house_count = all_buildings_dto.iter().filter(|b| b.owner_id == player_id && b.kind == 3).count() as i32;
+        let entry = gs.pop_cap.entry(player_id).or_insert(default_pop_cap());
+        *entry = default_pop_cap() + house_count;
+        // Cache buildings
+        if gs.buildings.is_empty() {
+            gs.buildings.extend(all_buildings_dto.clone());
+        }
+    }
 
     println!("Player {} connected (Chunk {}, {})", player_id, chunk_x, chunk_y);
 
     // Send Welcome
+    println!("[TRACE] Sending Welcome. Units: {}, Buildings: {}", all_units_dto.len(), all_buildings_dto.len());
+    
+    // Prepare data without inline locking
+    let (res, p_cap, p_used) = {
+        let gs = state.lock().await;
+        (
+            *gs.resources.get(&player_id).unwrap_or(&default_resources()),
+            *gs.pop_cap.get(&player_id).unwrap_or(&default_pop_cap()),
+            gs.units.get(&player_id).map(|u| u.len() as i32).unwrap_or(0)
+        )
+    };
+
     let welcome_msg = serde_json::to_string(&GameMessage::Welcome {
         player_id,
         chunk_x,
@@ -485,24 +1128,44 @@ async fn handle_connection(
         units: all_units_dto,
         buildings: all_buildings_dto,
         token: token.clone(),
+        resources: res,
+        pop_cap: p_cap,
+        pop_used: p_used,
     }).unwrap();
     
     if let Err(e) = write.send(Message::Text(welcome_msg)).await {
         println!("Failed to send welcome: {}", e);
         return;
     }
+    // println!("[TRACE] Welcome Sent");
 
     // Broadcast New Player
     let new_player_msg = serde_json::to_string(&GameMessage::NewPlayer {
         player: PlayerInfo { id: player_id, chunk_x, chunk_y }
     }).unwrap();
     let _ = tx.send(new_player_msg);
+    // println!("[TRACE] NewPlayer Broadcast");
+
+    // Broadcast initial resources to self (and others)
+    {
+        let gs = state.lock().await;
+        if let Some(res) = gs.resources.get(&player_id) {
+            let pop_cap = *gs.pop_cap.get(&player_id).unwrap_or(&default_pop_cap());
+            let pop_used = gs.units.get(&player_id).map(|u| u.len() as i32).unwrap_or(0);
+            let res_msg = GameMessage::ResourceUpdate { player_id, resources: *res, pop_cap, pop_used };
+            if let Ok(json) = serde_json::to_string(&res_msg) {
+                let _ = tx.send(json);
+            }
+        }
+    }
+    // println!("[TRACE] Resources Broadcast");
 
 
     // Heartbeat
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10)); // Reduced to 10s for better keepalive
 
     let mut send_task = tokio::spawn(async move {
+        // println!("[TRACE] Send Task Start");
         loop {
             tokio::select! {
                 Ok(msg) = rx.recv() => {
@@ -564,6 +1227,7 @@ async fn handle_connection(
     let recv_pool = pool.clone(); // Clone pool for async DB updates
 
     let mut recv_task = tokio::spawn(async move {
+        println!("RecvTask started for player {}", player_id);
         while let Some(Ok(msg)) = read.next().await {
             if msg.is_text() {
                 let text = msg.to_text().unwrap();
@@ -574,11 +1238,13 @@ async fn handle_connection(
                         GameMessage::UnitMove { player_id, unit_idx, x, y } => {
                             // 1. Update Memory State (Fast for broadcasts)
                             {
-                                let mut gs = recv_state.lock().unwrap();
-                                if let Some(units) = gs.units.get_mut(&player_id) {
-                                    if unit_idx < units.len() {
-                                        units[unit_idx].x = x;
-                                        units[unit_idx].y = y;
+                                // Use try_lock to avoid blocking recv loop
+                                if let Ok(mut gs) = recv_state.try_lock() {
+                                    if let Some(units) = gs.units.get_mut(&player_id) {
+                                        if unit_idx < units.len() {
+                                            units[unit_idx].x = x;
+                                            units[unit_idx].y = y;
+                                        }
                                     }
                                 }
                             }
@@ -599,11 +1265,13 @@ async fn handle_connection(
                         GameMessage::UnitSync { player_id, unit_idx, x, y } => {
                             // 1. Update Memory
                             {
-                                let mut gs = recv_state.lock().unwrap();
-                                if let Some(units) = gs.units.get_mut(&player_id) {
-                                    if unit_idx < units.len() {
-                                        units[unit_idx].x = x;
-                                        units[unit_idx].y = y;
+                                // Use try_lock to avoid blocking recv loop
+                                if let Ok(mut gs) = recv_state.try_lock() {
+                                    if let Some(units) = gs.units.get_mut(&player_id) {
+                                        if unit_idx < units.len() {
+                                            units[unit_idx].x = x;
+                                            units[unit_idx].y = y;
+                                        }
                                     }
                                 }
                             }
@@ -611,6 +1279,8 @@ async fn handle_connection(
                 let _ = tx.send(text.to_string());
                             
                             // 3. Optional DB Persist?
+                            // REMOVED to prevent DB connection starvation
+                            /*
                              if let Some(p) = &recv_pool {
                                 let res = sqlx::query("UPDATE units SET x = $1, y = $2 WHERE owner_id = $3 AND unit_idx = $4")
                                     .bind(x)
@@ -624,83 +1294,189 @@ async fn handle_connection(
                                     println!("DB Error on UnitSync: {}", e);
                                 }
                             }
+                            */
                         },
                         GameMessage::Build { kind, tile_x, tile_y } => {
-                            // Check if location is valid (simple check: no other building there)
-                            // We should also check ownership/resources but we skip for now.
-                            
-                            // 1. Update DB
-                            let id;
-                            if let Some(p) = &recv_pool {
-                                let rec = sqlx::query("INSERT INTO buildings (owner_id, kind, tile_x, tile_y) VALUES ($1, $2, $3, $4) RETURNING id")
-                                    .bind(player_id)
-                                    .bind(kind as i32)
-                                    .bind(tile_x)
-                                    .bind(tile_y)
-                                    .fetch_one(p)
-                                    .await;
-                                    
-                                if let Ok(r) = rec {
-                                    id = r.get("id");
-                                } else {
-                                    println!("DB Error on Build");
-                                    return;
+                            // Resource check and simple tile occupancy check
+                            // Use try_lock to avoid blocking
+                            if let Ok(mut gs) = recv_state.try_lock() {
+                                if gs.is_tile_blocked(tile_x, tile_y) {
+                                    continue;
                                 }
+                                let cost = cost_for_kind(kind);
+                                let entry = gs.resources.entry(player_id).or_insert(default_resources());
+                                if !entry.spend(&cost) {
+                                    continue;
+                                }
+                                // Update pop cap if house built
+                                if kind == 3 {
+                                    let cap = gs.pop_cap.entry(player_id).or_insert(default_pop_cap());
+                                    *cap += POP_FROM_HOUSE;
+                                }
+                                // Track progress start
+                                gs.building_progress.insert((tile_x, tile_y), BuildTask { owner_id: player_id, kind, tile_x, tile_y, progress: 0.0 });
                             } else {
-                                // Memory mode: fake ID
-                                id = rand::random::<i32>().abs();
+                                continue; // Skip build if contended
                             }
-                            
-                            // 2. Broadcast
-                            let msg = GameMessage::BuildingSpawned {
-                                building: BuildingDTO {
-                                    id,
-                                    owner_id: player_id,
-                                    kind,
-                                    tile_x,
-                                    tile_y
+
+                            // Broadcast initial progress
+                            if let Ok(json) = serde_json::to_string(&GameMessage::BuildProgress { tile_x, tile_y, kind, progress: 0.0 }) {
+                                let _ = tx.send(json);
+                            }
+
+                            // Resource update broadcast
+                            let gs = recv_state.lock().await;
+                            if let Some(res) = gs.resources.get(&player_id) {
+                                let pop_cap = *gs.pop_cap.get(&player_id).unwrap_or(&default_pop_cap());
+                                let pop_used = gs.units.get(&player_id).map(|u| u.len() as i32).unwrap_or(0);
+                                let res_msg = GameMessage::ResourceUpdate { player_id, resources: *res, pop_cap, pop_used };
+                                if let Ok(json) = serde_json::to_string(&res_msg) {
+                                    let _ = tx.send(json);
+                                }
+                            }
+                        },
+                        GameMessage::AssignGather { unit_ids, target_x, target_y, kind } => {
+                            if let Ok(mut gs) = recv_state.try_lock() {
+                                for uid in unit_ids {
+                                    gs.gather_tasks.insert((player_id, uid), GatherTask { kind, target_x, target_y });
+                                }
+                            }
+                        },
+                        GameMessage::TrainUnit { building_id, kind } => {
+                            // Only warrior supported for now
+                            if kind != 1 { continue; }
+                            let building = {
+                                if let Ok(gs) = recv_state.try_lock() {
+                                    gs.find_building(player_id, building_id)
+                                } else {
+                                    None
                                 }
                             };
-                            
-                            if let Ok(json) = serde_json::to_string(&msg) {
-                                let _ = tx.send(json);
+                            if building.is_none() { continue; }
+                            let pop_cap = {
+                                if let Ok(gs) = recv_state.try_lock() {
+                                    *gs.pop_cap.get(&player_id).unwrap_or(&default_pop_cap())
+                                } else {
+                                    0
+                                }
+                            };
+                            let pop_used = {
+                                if let Ok(gs) = recv_state.try_lock() {
+                                    gs.units.get(&player_id).map(|u| u.len() as i32).unwrap_or(0)
+                                } else {
+                                    0
+                                }
+                            };
+                            if pop_used >= pop_cap { continue; }
+
+                            // Resource check
+                            {
+                                if let Ok(mut gs) = recv_state.try_lock() {
+                                    let entry = gs.resources.entry(player_id).or_insert(default_resources());
+                                    if !entry.spend(&COST_WARRIOR) {
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+
+                            // Compute spawn position near building
+                            let b = building.unwrap();
+                            let tile_size = 16.0;
+                            let spawn_x = b.tile_x as f32 * tile_size + tile_size;
+                            let spawn_y = b.tile_y as f32 * tile_size + tile_size * 0.5;
+
+                            // Persist and broadcast
+                            let next_idx = {
+                                if let Ok(mut gs) = recv_state.try_lock() {
+                                    let entry = gs.units.entry(player_id).or_insert(Vec::new());
+                                    let idx = entry.len();
+                                    entry.push(UnitState { x: spawn_x, y: spawn_y, hp: WARRIOR_HP, kind: 1 });
+                                    idx
+                                } else {
+                                    0 // Fail gracefully
+                                }
+                            };
+
+                            let new_unit_msg = serde_json::to_string(&GameMessage::UnitSpawned {
+                                unit: UnitDTO {
+                                    owner_id: player_id,
+                                    unit_idx: next_idx,
+                                    x: spawn_x,
+                                    y: spawn_y,
+                                    kind: 1,
+                                    hp: WARRIOR_HP,
+                                }
+                            }).unwrap();
+                            let _ = tx.send(new_unit_msg);
+
+                            // Resource update
+                            let gs = recv_state.lock().await;
+                            if let Some(res) = gs.resources.get(&player_id) {
+                                let pop_cap = *gs.pop_cap.get(&player_id).unwrap_or(&default_pop_cap());
+                                let pop_used = gs.units.get(&player_id).map(|u| u.len() as i32).unwrap_or(0);
+                                let res_msg = GameMessage::ResourceUpdate { player_id, resources: *res, pop_cap, pop_used };
+                                if let Ok(json) = serde_json::to_string(&res_msg) {
+                                    let _ = tx.send(json);
+                                }
                             }
                         },
                         GameMessage::SpawnUnit => {
                             // Handle Spawn
                             let (chunk_x, chunk_y, next_idx, unit_count) = {
-                                let mut gs = recv_state.lock().unwrap();
-                                // Separate borrows: First get player coords (values only)
-                                let player_coords = gs.players.get(&player_id).map(|p| (p.chunk_x, p.chunk_y));
-                                
-                                if let Some((cx, cy)) = player_coords {
-                                    // Now mutable borrow is safe
-                                    let units = gs.units.entry(player_id).or_insert(Vec::new());
-                                    (cx, cy, units.len(), units.len())
+                                if let Ok(mut gs) = recv_state.try_lock() {
+                                    // Separate borrows: First get player coords (values only)
+                                    let player_coords = gs.players.get(&player_id).map(|p| (p.chunk_x, p.chunk_y));
+                                    
+                                    if let Some((cx, cy)) = player_coords {
+                                        // Now mutable borrow is safe
+                                        let units = gs.units.entry(player_id).or_insert(Vec::new());
+                                        (cx, cy, units.len(), units.len())
+                                    } else {
+                                        (0, 0, 0, 0)
+                                    }
                                 } else {
                                     (0, 0, 0, 0)
                                 }
                             };
                             
                             // LIMIT: Max 5 workers
-                            if unit_count >= 5 {
-                                return;
+                            let pop_cap = {
+                                if let Ok(gs) = recv_state.try_lock() {
+                                    *gs.pop_cap.get(&player_id).unwrap_or(&default_pop_cap())
+                                } else {
+                                    0
+                                }
+                            };
+                            if unit_count as i32 >= pop_cap {
+                                continue;
+                            }
+
+                            // Resource check
+                            {
+                                if let Ok(mut gs) = recv_state.try_lock() {
+                                    let entry = gs.resources.entry(player_id).or_insert(default_resources());
+                                    if !entry.spend(&COST_WORKER) {
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                }
                             }
                             
                             // Calculate Spawn Pos (Near Town Center)
+                            // ... (omitted for brevity, same logic) ...
                             let chunk_size = 32.0;
                             let tile_size = 16.0;
                             let mid = chunk_size / 2.0;
                             
-                            // Town Center tile position
                             let tc_tile_x = chunk_x as f32 * chunk_size + mid;
                             let tc_tile_y = chunk_y as f32 * chunk_size + mid;
                             
-                            // Town Center world position (TOP-LEFT of tile)
                             let tc_world_x = tc_tile_x * tile_size;
                             let tc_world_y = tc_tile_y * tile_size;
                             
-                            // Spawn below TC, spread horizontally based on unit index
                             let col = (next_idx % 3) as f32;
                             let row = (next_idx / 3) as f32;
                             let spawn_x = tc_world_x + (col * tile_size);
@@ -719,9 +1495,10 @@ async fn handle_connection(
                             
                             // 2. Update Memory
                             {
-                                let mut gs = recv_state.lock().unwrap();
-                                let entry = gs.units.entry(player_id).or_insert(Vec::new());
-                                entry.push(UnitState { x: spawn_x, y: spawn_y });
+                                if let Ok(mut gs) = recv_state.try_lock() {
+                                    let entry = gs.units.entry(player_id).or_insert(Vec::new());
+                                    entry.push(UnitState { x: spawn_x, y: spawn_y, hp: WORKER_HP, kind: 0 });
+                                }
                             }
                             
                             // 3. Broadcast
@@ -730,11 +1507,28 @@ async fn handle_connection(
                                     owner_id: player_id,
                                     unit_idx: next_idx,
                                     x: spawn_x,
-                                    y: spawn_y
+                                    y: spawn_y,
+                                    kind: 0,
+                                    hp: WORKER_HP,
                                 }
                             }).unwrap();
                             
                             let _ = tx.send(new_unit_msg);
+
+                            // 4. Broadcast resource update
+                            let mut res_msg = None;
+                            if let Ok(gs) = recv_state.try_lock() {
+                                if let Some(res) = gs.resources.get(&player_id) {
+                                    let pop_cap = *gs.pop_cap.get(&player_id).unwrap_or(&default_pop_cap());
+                                    let pop_used = gs.units.get(&player_id).map(|u| u.len() as i32).unwrap_or(0);
+                                    res_msg = Some(GameMessage::ResourceUpdate { player_id, resources: *res, pop_cap, pop_used });
+                                }
+                            }
+                            if let Some(msg) = res_msg {
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    let _ = tx.send(json);
+                                }
+                            }
                         },
                         _ => {}
                     }
@@ -749,32 +1543,22 @@ async fn handle_connection(
     };
     
     // Cleanup
+    println!("Player {} disconnected", player_id);
     {
         // Only remove from memory if NOT in DB mode (i.e. ephemeral session)
-        // If we are in DB mode, we want to keep the players in memory so other players see them
-        // or at least we rely on DB for state.
+        // ... comments ...
         
-        // The bug "server dies" is likely because we remove the player from state,
-        // but the other players might still be referencing them? 
-        // Or simply, when they reconnect, the state is gone from RAM but DB load logic might be flawed?
-        // Actually, if we remove from RAM, the next `Welcome` message to OTHER players 
-        // (or even the re-joining player) might miss them if it relies on `gs.players`.
+        let mut gs = state.lock().await;
         
-        // Let's KEEP them in memory for now to ensure stability and visibility.
-        // Memory leak risk? Yes, but for small player counts it's fine.
-        // In a real MMO we'd unload inactive chunks.
-        
-        let mut gs = state.lock().unwrap();
         if pool.is_none() {
             // Memory Mode: Cleanup
-        gs.players.remove(&player_id);
+            gs.players.remove(&player_id);
             gs.units.remove(&player_id); 
         } else {
             // DB Mode: KEEP in memory so they remain visible on map as "ghosts" / offline players
             // This prevents "holes" in the map and missing units.
         }
     }
-    println!("Player {} disconnected", player_id);
 }
 
 async fn create_new_player(pool: &Pool<Postgres>) -> (i32, i32, i32, String) {
