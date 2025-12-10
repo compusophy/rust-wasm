@@ -194,6 +194,7 @@ struct TowerShot {
 #[derive(Clone, Copy)]
 struct TileProgress {
     progress: f32,
+    kind: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -406,11 +407,22 @@ struct GameState {
     wall_end: Option<(i32, i32)>,    // Tile coords - second point
     wall_preview: Vec<(i32, i32)>,   // Preview tiles to build
     
+    // Wall Construction Logic (Client-Side)
+    pending_wall: Vec<(i32, i32)>, 
+    building_active: bool,
+    
     // Sync
     last_sync_time: f64,
     
     // Smooth Zoom
     target_zoom: f32,
+    
+    // UI State
+    show_delete_confirm: bool,
+    pending_single_build: Option<(BuildKind, i32, i32)>, // kind, tile coords
+
+    // Training queue (optimistic, drained when UnitSpawned arrives)
+    training_queue: Vec<f32>, // seconds remaining per queued worker
 }
 
 impl GameState {
@@ -428,7 +440,7 @@ impl GameState {
             server_progress: HashMap::new(),
             camera_x: 0.0,
             camera_y: 0.0,
-            zoom: 1.0,
+            zoom: 1.5,
             my_id: None,
             my_chunk_x: 0,
             my_chunk_y: 0,
@@ -450,8 +462,13 @@ impl GameState {
             wall_start: None,
             wall_end: None,
             wall_preview: Vec::new(),
+            pending_wall: Vec::new(),
+            building_active: false,
             last_sync_time: 0.0,
-            target_zoom: 1.0,
+            target_zoom: 1.5,
+            show_delete_confirm: false,
+            pending_single_build: None,
+            training_queue: Vec::new(),
         };
 
         // Generate Initial Chunk (0,0)
@@ -802,8 +819,120 @@ impl GameState {
 
         // --- BUILD PROGRESS ---
         // Now authoritative on server; only render server progress.
+        
+        // --- CLIENT-SIDE WALL CONSTRUCTION QUEUE ---
+        if self.building_active && !self.pending_wall.is_empty() {
+             let (tx, ty) = self.pending_wall[0];
+             
+             // Check if this tile is already "Built" (exists in buildings list)
+             let is_built = self.buildings.iter().any(|b| b.tile_x == tx && b.tile_y == ty);
+             
+             // If built, remove from queue and move to next
+             if is_built {
+                 self.pending_wall.remove(0);
+                 if self.pending_wall.is_empty() {
+                     self.building_active = false;
+                 } else {
+                    // Send worker to NEXT tile
+                    let (next_tx, next_ty) = self.pending_wall[0];
+                    if let Some(target_pos) = self.find_adjacent_walkable(next_tx, next_ty) {
+                        let target_x = target_pos.0;
+                        let target_y = target_pos.1;
+                        if let Some(my_id) = self.my_id {
+                             let mut selected_indices = Vec::new();
+                             for (i, u) in self.units.iter().enumerate() {
+                                 if u.selected && u.owner_id == my_id && u.kind == UnitKind::Worker.to_u8() {
+                                     selected_indices.push(i);
+                                 }
+                             }
+                             
+                             if !selected_indices.is_empty() {
+                                  // Update paths locally
+                                  let mut paths = Vec::new();
+                                  for idx in &selected_indices {
+                                     if let Some(u) = self.units.get(*idx) {
+                                         let p = self.find_path((u.x, u.y), (target_x, target_y));
+                                         paths.push(p);
+                                     }
+                                  }
+                                  for (i, p) in paths.into_iter().enumerate() {
+                                     let unit_idx = selected_indices[i];
+                                     if let Some(u) = self.units.get_mut(unit_idx) {
+                                         if !p.is_empty() { u.path = p; u.job = UnitJob::Idle; }
+                                     }
+                                  }
+                                  // Send server commands
+                                  if let Some(ws) = &self.socket {
+                                      for idx in selected_indices {
+                                          // Map to player-local index
+                                            let mut my_unit_idx = 0;
+                                            for (k, u) in self.units.iter().enumerate() {
+                                                if u.owner_id == my_id {
+                                                    if k == idx { break; }
+                                                    my_unit_idx += 1;
+                                                }
+                                            }
+                                            let msg = GameMessage::UnitMove { player_id: my_id, unit_idx: my_unit_idx, x: target_x, y: target_y };
+                                            if let Ok(json) = serde_json::to_string(&msg) { let _ = ws.send_with_str(&json); }
+                                      }
+                                  }
+                             }
+                        }
+                    }
+                 }
+             } else {
+                 // Not built yet. 
+                 // Check if we should START building it.
+                 // Logic: 
+                 // 1. Worker needs to be close.
+                 // 2. If close, send Build command.
+                 
+                 // Find our workers
+                 if let Some(my_id) = self.my_id {
+                     let mut ready_to_build = false;
+                     let target_pos_x = tx as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE/2.0;
+                     let target_pos_y = ty as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE/2.0;
+                     
+                     for u in &self.units {
+                         if u.selected && u.owner_id == my_id && u.kind == UnitKind::Worker.to_u8() {
+                             let dist = ((u.x - target_pos_x).powi(2) + (u.y - target_pos_y).powi(2)).sqrt();
+                             if dist < 60.0 { // Increased from 40.0 to 60.0 to be more lenient
+                                 ready_to_build = true;
+                                 break;
+                             }
+                         }
+                     }
+                     
+                     if ready_to_build {
+                         // Check if construction already started (progress exists)
+                         let already_building = self.server_progress.contains_key(&(tx, ty));
+                         if !already_building {
+                             // Send Build Command
+                             if let Some(ws) = &self.socket {
+                                let msg = GameMessage::Build { kind: BuildKind::Wall.to_kind_id(), tile_x: tx, tile_y: ty };
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    let _ = ws.send_with_str(&json);
+                                }
+                             }
+                            // Add dummy progress with known kind so we don't spam Build commands
+                            self.server_progress.insert((tx, ty), TileProgress { progress: 0.01, kind: BuildKind::Wall.to_kind_id() });
+                         }
+                     }
+                 }
+             }
+        }
+        
         // --- GATHERING PROGRESS ---
         self.update_gathering(dt);
+        // --- TRAINING QUEUE (optimistic) ---
+        if !self.training_queue.is_empty() {
+            if let Some(front) = self.training_queue.first_mut() {
+                *front -= dt as f32;
+                if *front <= 0.0 {
+                    self.training_queue.remove(0);
+                }
+            }
+        }
         // --- TOWER SHOTS (server-driven; only decay TTL) ---
         for s in &mut self.tower_shots {
             s.ttl -= dt as f32;
@@ -865,6 +994,12 @@ impl GameState {
         let build_btn_x = 10.0;
         let build_btn_y = home_btn_y;
 
+        // Check Selected Unit/Building Icons (above footer, CENTERED) - click to deselect
+        let footer_height = 60.0;
+        let unit_icon_size = 20.0;
+        let gap = 4.0;
+        let icons_y = HEIGHT as f32 - footer_height - unit_icon_size - 5.0;
+        
         // 0. Check Build Menu Options (Floating above footer)
         if self.build_menu_open {
             let options = [
@@ -884,7 +1019,7 @@ impl GameState {
                         self.wall_start = None;
                         self.wall_end = None;
                         self.wall_preview.clear();
-                        self.build_menu_open = false; // Close for walls as it changes footer mode
+                        // self.build_menu_open = false; // Close for walls as it changes footer mode
                     } else {
                         // Toggle or Select
                         if self.selected_build == Some(*kind) {
@@ -902,12 +1037,9 @@ impl GameState {
                 }
             }
         }
-        
         // Check Selected Unit/Building Icons (above footer, CENTERED) - click to deselect
-        let footer_height = 60.0;
-        let unit_icon_size = 20.0;
-        let gap = 4.0;
-        let icons_y = HEIGHT as f32 - footer_height - unit_icon_size - 5.0;
+        // NOTE: Icons logic removed from here as it duplicates variable definitions and might shadow 'footer_height' etc if reordered poorly.
+        // But we need the logic. Let's just use the values defined above.
         
         if screen_y >= icons_y && screen_y <= icons_y + unit_icon_size {
             // Get selected units/buildings
@@ -959,8 +1091,18 @@ impl GameState {
                 }
             }
         }
+        // Expand UI clickable area upward for floating menus (build submenu, skull confirm)
+        let mut ui_top = HEIGHT as f32 - footer_height;
+        if self.show_delete_confirm {
+            ui_top -= btn_size + 10.0; // skull button above delete
+        }
+        if self.build_menu_open {
+            let menu_gap = 10.0;
+            let menu_height = 5.0 * (btn_size + menu_gap); // number of options * spacing
+            ui_top -= menu_height;
+        }
         
-        if screen_y > HEIGHT as f32 - footer_height {
+        if screen_y > ui_top {
             // Click is in Footer
             
             // 1. Check Home Button (Center)
@@ -979,7 +1121,7 @@ impl GameState {
                            
                            let bx = b.tile_x as f32 * TILE_SIZE_BASE;
                            let by = b.tile_y as f32 * TILE_SIZE_BASE;
-                           self.target_zoom = 1.0;
+                           self.target_zoom = 1.5;
                            self.camera_x = bx;
                            self.camera_y = by;
                            break;
@@ -1041,6 +1183,8 @@ impl GameState {
                                  let _ = ws.send_with_str(&json);
                              }
                         }
+                        // Show local training progress bar (assumes ~4s server training)
+                        self.training_queue.push(4.0);
                         return;
                     }
                 } else if b.kind == BuildKind::Barracks.to_kind_id() {
@@ -1106,38 +1250,52 @@ impl GameState {
                     let del_btn_x = WIDTH as f32 - btn_size - 10.0;
                     let del_btn_y = home_btn_y;
                     
+                    // Check Delete Button Click
                     if screen_x >= del_btn_x && screen_x <= del_btn_x + btn_size &&
                        screen_y >= del_btn_y && screen_y <= del_btn_y + btn_size {
-                        // Handle Delete
-                        if let Some((is_b, idx)) = entity_info {
-                            if let Some(ws) = &self.socket {
-                                let msg = if is_b {
-                                    let b = &self.buildings[idx];
-                                    GameMessage::DeleteBuilding { tile_x: b.tile_x, tile_y: b.tile_y }
-                                } else {
-                                    // Calculate player-local unit index
-                                    let mut my_idx = 0;
-                                    for (k, u) in self.units.iter().enumerate() {
-                                        if u.owner_id == my_id {
-                                            if k == idx { break; }
-                                            my_idx += 1;
+                        self.show_delete_confirm = !self.show_delete_confirm;
+                        return;
+                    }
+
+                    // Check Skull Menu Button Click (if visible)
+                    if self.show_delete_confirm {
+                        let skull_btn_y = del_btn_y - btn_size - 10.0;
+                        if screen_x >= del_btn_x && screen_x <= del_btn_x + btn_size &&
+                           screen_y >= skull_btn_y && screen_y <= skull_btn_y + btn_size {
+                               
+                            // CONFIRMED DELETE
+                            self.show_delete_confirm = false;
+
+                            if let Some((is_b, idx)) = entity_info {
+                                if let Some(ws) = &self.socket {
+                                    let msg = if is_b {
+                                        let b = &self.buildings[idx];
+                                        GameMessage::DeleteBuilding { tile_x: b.tile_x, tile_y: b.tile_y }
+                                    } else {
+                                        // Calculate player-local unit index
+                                        let mut my_idx = 0;
+                                        for (k, u) in self.units.iter().enumerate() {
+                                            if u.owner_id == my_id {
+                                                if k == idx { break; }
+                                                my_idx += 1;
+                                            }
                                         }
+                                        GameMessage::DeleteUnit { unit_idx: my_idx }
+                                    };
+                                    
+                                    if let Ok(json) = serde_json::to_string(&msg) {
+                                        let _ = ws.send_with_str(&json);
                                     }
-                                    GameMessage::DeleteUnit { unit_idx: my_idx }
-                                };
-                                
-                                if let Ok(json) = serde_json::to_string(&msg) {
-                                    let _ = ws.send_with_str(&json);
                                 }
                             }
+                            return;
                         }
-                        return;
                     }
                  }
             }
             
-            // 6. Check Confirm/Cancel buttons (when wall placement is ready)
-            if self.build_mode && self.wall_end.is_some() {
+            // 6. Check Confirm/Cancel buttons (when build placement is pending)
+            if (self.build_mode && self.wall_end.is_some()) || self.pending_single_build.is_some() {
                 // Confirm button (green check) - right side of footer (shifted left to avoid delete button space?)
                 // Actually Delete button only appears if 1 unit selected.
                 // Confirm/Cancel appears if build mode active.
@@ -1170,7 +1328,17 @@ impl GameState {
                 
                 if screen_x >= confirm_btn_x && screen_x <= confirm_btn_x + btn_size &&
                    screen_y >= confirm_btn_y && screen_y <= confirm_btn_y + btn_size {
-                    self.confirm_wall_build();
+                    if self.build_mode && self.wall_end.is_some() {
+                        self.confirm_wall_build();
+                    } else if let Some((kind, tx, ty)) = self.pending_single_build.take() {
+                        if let Some(ws) = &self.socket {
+                            let msg = GameMessage::Build { kind: kind.to_kind_id(), tile_x: tx, tile_y: ty };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = ws.send_with_str(&json);
+                            }
+                        }
+                        self.selected_build = None;
+                    }
                     return;
                 }
                 
@@ -1179,7 +1347,12 @@ impl GameState {
                 
                 if screen_x >= cancel_btn_x && screen_x <= cancel_btn_x + btn_size &&
                    screen_y >= cancel_btn_y && screen_y <= cancel_btn_y + btn_size {
-                    self.cancel_wall_build();
+                    if self.build_mode && self.wall_end.is_some() {
+                        self.cancel_wall_build();
+                    } else {
+                        self.pending_single_build = None;
+                        self.selected_build = None;
+                    }
                     return;
                 }
             }
@@ -1196,15 +1369,70 @@ impl GameState {
         if let Some(kind) = self.selected_build {
             if kind != BuildKind::Wall {
                 if self.is_tile_buildable(clicked_tile_x, clicked_tile_y) {
-                    // Optimistic send; server will validate resources/buildability
-                    if let Some(ws) = &self.socket {
-                        let msg = GameMessage::Build { kind: kind.to_kind_id(), tile_x: clicked_tile_x, tile_y: clicked_tile_y };
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            let _ = ws.send_with_str(&json);
+                    // Stage pending build; confirmation will send the Build message.
+                    self.pending_single_build = Some((kind, clicked_tile_x, clicked_tile_y));
+                    self.build_menu_open = false;
+
+                    // Move selected workers to build site (so they'll be in range for progress)
+                    if let Some(target_pos) = self.find_adjacent_walkable(clicked_tile_x, clicked_tile_y) {
+                        let mut selected_indices = Vec::new();
+                        for (i, u) in self.units.iter().enumerate() {
+                            if u.selected && u.owner_id == my_id && u.kind == UnitKind::Worker.to_u8() {
+                                selected_indices.push(i);
+                            }
+                        }
+                        
+                        if !selected_indices.is_empty() {
+                            let target_x = target_pos.0;
+                            let target_y = target_pos.1;
+                            
+                            let mut start_positions = Vec::new();
+                            for idx in &selected_indices {
+                                if let Some(u) = self.units.get(*idx) {
+                                    start_positions.push((u.x, u.y));
+                                }
+                            }
+
+                            let mut paths = Vec::new();
+                            for (sx, sy) in start_positions {
+                                let p = self.find_path((sx, sy), (target_x, target_y));
+                                paths.push(p);
+                            }
+
+                            for (i, p) in paths.into_iter().enumerate() {
+                                let unit_idx = selected_indices[i];
+                                if let Some(u) = self.units.get_mut(unit_idx) {
+                                    if !p.is_empty() {
+                                        u.path = p;
+                                        u.job = UnitJob::Idle; 
+                                    }
+                                }
+                            }
+                            
+                            if let Some(ws) = &self.socket {
+                                for idx in selected_indices {
+                                    // Need to find player-local index
+                                    let mut my_unit_idx = 0;
+                                    for (k, u) in self.units.iter().enumerate() {
+                                        if u.owner_id == my_id {
+                                            if k == idx { break; }
+                                            my_unit_idx += 1;
+                                        }
+                                    }
+                                    
+                                    let msg = GameMessage::UnitMove { 
+                                        player_id: my_id, 
+                                        unit_idx: my_unit_idx, 
+                                        x: target_x, 
+                                        y: target_y 
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&msg) {
+                                        let _ = ws.send_with_str(&json);
+                                    }
+                                }
+                            }
                         }
                     }
-                    self.selected_build = None;
-                    self.build_menu_open = false;
                 }
                 return;
             }
@@ -1528,14 +1756,82 @@ impl GameState {
             return;
         }
         // Send wall build intents; server will validate and build
-        if let Some(ws) = &self.socket {
-            for (tx, ty) in &self.wall_preview {
-                let msg = GameMessage::Build { kind: BuildKind::Wall.to_kind_id(), tile_x: *tx, tile_y: *ty };
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let _ = ws.send_with_str(&json);
-                }
+        
+        // OLD LOGIC: Build all at once
+        // if let Some(ws) = &self.socket {
+        //     for (i, (tx, ty)) in self.wall_preview.iter().enumerate() { ... }
+        // }
+        
+        // NEW LOGIC: Queue them up
+        self.pending_wall = self.wall_preview.clone();
+        self.building_active = true;
+        
+        // Move workers to the FIRST tile immediately to kickstart the process
+        if let Some((ftx, fty)) = self.pending_wall.first() {
+            if let Some(target_pos) = self.find_adjacent_walkable(*ftx, *fty) {
+                 let my_id = if let Some(id) = self.my_id { id } else { return };
+                 let mut selected_indices = Vec::new();
+                 for (i, u) in self.units.iter().enumerate() {
+                     if u.selected && u.owner_id == my_id && u.kind == UnitKind::Worker.to_u8() {
+                         selected_indices.push(i);
+                     }
+                 }
+                 
+                 if !selected_indices.is_empty() {
+                     let target_x = target_pos.0;
+                     let target_y = target_pos.1;
+                     
+                     // 1. Collect start positions
+                     let mut start_positions = Vec::new();
+                     for idx in &selected_indices {
+                         if let Some(u) = self.units.get(*idx) {
+                             start_positions.push((u.x, u.y));
+                         }
+                     }
+
+                     // 2. Calculate paths
+                     let mut paths = Vec::new();
+                     for (sx, sy) in start_positions {
+                         let p = self.find_path((sx, sy), (target_x, target_y));
+                         paths.push(p);
+                     }
+
+                     // 3. Apply paths
+                     for (i, p) in paths.into_iter().enumerate() {
+                         let unit_idx = selected_indices[i];
+                         if let Some(u) = self.units.get_mut(unit_idx) {
+                             if !p.is_empty() {
+                                 u.path = p;
+                                 u.job = UnitJob::Idle;
+                             }
+                         }
+                     }
+                     
+                     if let Some(ws) = &self.socket {
+                         for idx in selected_indices {
+                            let mut my_unit_idx = 0;
+                            for (k, u) in self.units.iter().enumerate() {
+                                if u.owner_id == my_id {
+                                    if k == idx { break; }
+                                    my_unit_idx += 1;
+                                }
+                            }
+                             
+                            let msg = GameMessage::UnitMove { 
+                                player_id: my_id, 
+                                unit_idx: my_unit_idx, 
+                                x: target_x, 
+                                y: target_y 
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = ws.send_with_str(&json);
+                            }
+                         }
+                     }
+                 }
             }
         }
+
         // Reset build state
         self.build_mode = false;
         self.selected_build = None;
@@ -1992,6 +2288,10 @@ pub fn run_game() -> Result<(), JsValue> {
                             });
                             if Some(unit.owner_id) == state.my_id {
                                 state.pop_used += 1;
+                                // Drain one training slot if this was a worker
+                                if unit.kind == UnitKind::Worker.to_u8() && !state.training_queue.is_empty() {
+                                    state.training_queue.remove(0);
+                                }
                             }
                             log("New unit spawned!");
                         },
@@ -2013,8 +2313,8 @@ pub fn run_game() -> Result<(), JsValue> {
                             state.server_progress.remove(&(building.tile_x, building.tile_y));
                             log("New building spawned!");
                         },
-                        GameMessage::BuildProgress { tile_x, tile_y, kind: _, progress } => {
-                            state.server_progress.insert((tile_x, tile_y), TileProgress { progress });
+                        GameMessage::BuildProgress { tile_x, tile_y, kind, progress } => {
+                            state.server_progress.insert((tile_x, tile_y), TileProgress { progress, kind });
                         },
                         GameMessage::UnitHp { owner_id, unit_idx, hp } => {
                             let mut count = 0;
@@ -2325,6 +2625,20 @@ pub fn run_game() -> Result<(), JsValue> {
         let min_cy = (view_min_y / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
         let max_cy = (view_max_y / (CHUNK_SIZE as f32 * TILE_SIZE_BASE)).floor() as i32;
 
+        // --- COLOR PALETTE ---
+        let col_player_blue = (0, 0, 150); // Dark Blue
+        let col_player_wall_1 = (80, 80, 180);
+        let col_player_wall_2 = (50, 50, 140);
+        
+        let col_enemy_red = (200, 50, 50); // Red
+        let col_enemy_wall_1 = (180, 80, 80);
+        let col_enemy_wall_2 = (140, 50, 50);
+        
+        let col_ui_green = (0, 180, 0); // Standard UI Green (Confirm, Plus)
+        let col_ui_red = (200, 50, 50); // Standard UI Red (Deny, Delete)
+        let col_neon_green = (0, 255, 0); // Selection / Highlights
+        let col_preview_blue = (100, 100, 255); // Wall Preview
+
         // Render Chunks
         for cy in min_cy..=max_cy {
             for cx in min_cx..=max_cx {
@@ -2382,7 +2696,7 @@ pub fn run_game() -> Result<(), JsValue> {
             
             if b.kind == 0 { // Town Center - 1 tile, same size as everything else
                 let size = tile_size;
-                let color = if Some(b.owner_id) == gs.my_id { (0, 0, 150) } else { (255, 0, 0) };
+                let color = if Some(b.owner_id) == gs.my_id { col_player_blue } else { col_enemy_red };
                 
                 // Render at TOP-LEFT (same as tiles)
                 buffer.rect(sx as i32, sy as i32, size.ceil() as i32, size.ceil() as i32, color.0, color.1, color.2);
@@ -2402,10 +2716,10 @@ pub fn run_game() -> Result<(), JsValue> {
                 // Blue for my walls, red for enemy walls
                 let (c1, c2) = if Some(b.owner_id) == gs.my_id {
                     // Blue bricks (lighter/darker alternating)
-                    ((80, 80, 180), (50, 50, 140))
+                    (col_player_wall_1, col_player_wall_2)
                 } else {
                     // Red bricks (lighter/darker alternating)
-                    ((180, 80, 80), (140, 50, 50))
+                    (col_enemy_wall_1, col_enemy_wall_2)
                 };
                 
                 // 2x2 brick grid with alternating shades
@@ -2475,10 +2789,10 @@ pub fn run_game() -> Result<(), JsValue> {
                 let g = gap.ceil() as i32;
                 
                 // Blue preview bricks (same pattern as real walls)
-                buffer.rect(base_x, base_y, sq, sq, 50, 100, 200);
-                buffer.rect(base_x + sq + g, base_y, sq, sq, 40, 80, 180);
-                buffer.rect(base_x, base_y + sq + g, sq, sq, 40, 80, 180);
-                buffer.rect(base_x + sq + g, base_y + sq + g, sq, sq, 50, 100, 200);
+                buffer.rect(base_x, base_y, sq, sq, col_preview_blue.0, col_preview_blue.1, col_preview_blue.2);
+                buffer.rect(base_x + sq + g, base_y, sq, sq, (col_preview_blue.0 as f32 * 0.8) as u8, (col_preview_blue.1 as f32 * 0.8) as u8, (col_preview_blue.2 as f32 * 0.8) as u8);
+                buffer.rect(base_x, base_y + sq + g, sq, sq, (col_preview_blue.0 as f32 * 0.8) as u8, (col_preview_blue.1 as f32 * 0.8) as u8, (col_preview_blue.2 as f32 * 0.8) as u8);
+                buffer.rect(base_x + sq + g, base_y + sq + g, sq, sq, col_preview_blue.0, col_preview_blue.1, col_preview_blue.2);
             };
             
             // Draw start point as blue preview (not just outline)
@@ -2491,7 +2805,7 @@ pub fn run_game() -> Result<(), JsValue> {
                     let tile_world_y = ty as f32 * TILE_SIZE_BASE;
                     let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
                     let sy = (tile_world_y - cam_y) * zoom + screen_center_y;
-                    buffer.rect_outline(sx as i32, sy as i32, tile_size.ceil() as i32, tile_size.ceil() as i32, 0, 255, 0);
+                    buffer.rect_outline(sx as i32, sy as i32, tile_size.ceil() as i32, tile_size.ceil() as i32, col_neon_green.0, col_neon_green.1, col_neon_green.2);
                 }
             }
             
@@ -2501,8 +2815,29 @@ pub fn run_game() -> Result<(), JsValue> {
             }
         }
 
-        // --- BUILD PROGRESS BARS (server-driven) ---
+        // --- BUILD GHOSTS + PROGRESS BARS (server-driven) ---
         for ((tx, ty), prog) in &gs.server_progress {
+            // Draw ghost footprint using kind color scaled by progress
+            let base_color = match prog.kind {
+                0 => (0, 0, 150),      // Town Center
+                1 => (150, 150, 150),  // Wall
+                2 => (80, 160, 80),    // Farm
+                3 => (220, 200, 140),  // House
+                4 => (160, 160, 180),  // Tower
+                5 => (180, 80, 80),    // Barracks
+                _ => (120, 120, 120),
+            };
+            let factor = (0.3 + prog.progress.clamp(0.0, 1.0) * 0.7).min(1.0);
+            let cr = (base_color.0 as f32 * factor) as i32;
+            let cg = (base_color.1 as f32 * factor) as i32;
+            let cb = (base_color.2 as f32 * factor) as i32;
+            let tile_world_x = *tx as f32 * TILE_SIZE_BASE;
+            let tile_world_y = *ty as f32 * TILE_SIZE_BASE;
+            let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
+            let sy = (tile_world_y - cam_y) * zoom + screen_center_y;
+            buffer.rect(sx as i32, sy as i32, tile_size.ceil() as i32, tile_size.ceil() as i32, cr as u8, cg as u8, cb as u8);
+            buffer.rect_outline(sx as i32, sy as i32, tile_size.ceil() as i32, tile_size.ceil() as i32, 20, 20, 20);
+
             let tile_world_x = *tx as f32 * TILE_SIZE_BASE;
             let tile_world_y = *ty as f32 * TILE_SIZE_BASE;
             let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
@@ -2521,6 +2856,35 @@ pub fn run_game() -> Result<(), JsValue> {
             let sx2 = (shot.x2 - cam_x) * zoom + screen_center_x;
             let sy2 = (shot.y2 - cam_y) * zoom + screen_center_y;
             buffer.line(sx1 as i32, sy1 as i32, sx2 as i32, sy2 as i32, 255, 200, 50, false);
+        }
+
+        // Training Queue UI near spawn location (progress + ghost worker)
+        if let Some(my_id) = gs.my_id {
+            if let Some(tc) = gs.buildings.iter().find(|b| b.owner_id == my_id && b.kind == 0) {
+                if let Some(time_left) = gs.training_queue.first() {
+                    let total = 4.0_f32;
+                    let pct = (1.0 - (*time_left / total)).clamp(0.0, 1.0);
+                    // Approximate spawn spot: below TC, centered
+                    let spawn_px = tc.tile_x as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE * 0.5;
+                    let spawn_py = tc.tile_y as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE * 2.0;
+                    let sx = (spawn_px - cam_x) * zoom + screen_center_x;
+                    let sy = (spawn_py - cam_y) * zoom + screen_center_y;
+
+                    let bar_w = tile_size;
+                    let bar_h = 5.0;
+                    let bar_y = sy - bar_h - 6.0;
+                    buffer.rect(sx as i32, bar_y as i32, bar_w as i32, bar_h as i32, 20, 20, 20);
+                    buffer.rect(sx as i32, bar_y as i32, (bar_w * pct) as i32, bar_h as i32, 0, 180, 0);
+
+                    // Ghost worker silhouette that brightens as pct rises
+                    let ghost_size = (TILE_SIZE_BASE * 0.8 * zoom).max(8.0);
+                    let gx = sx - ghost_size / 2.0;
+                    let gy = sy - ghost_size / 2.0;
+                    let alpha = (0.2 + pct * 0.8).clamp(0.2, 1.0);
+                    let wb = (200.0 * alpha) as u8; // blue-ish ghost
+                    buffer.rect(gx as i32, gy as i32, ghost_size as i32, ghost_size as i32, 0, 0, wb);
+                }
+            }
         }
 
         // Render Units
@@ -2668,7 +3032,7 @@ pub fn run_game() -> Result<(), JsValue> {
         // Group Select Button (Right of Home) - Simple box outline icon
         let group_btn_x = home_btn_x + btn_size + 10.0;
         let group_btn_y = home_btn_y;
-        let group_color = if gs.group_select_mode { (0, 200, 0) } else { (80, 80, 80) };
+        let group_color = if gs.group_select_mode { col_neon_green } else { (80, 80, 80) };
         buffer.rect(group_btn_x as i32, group_btn_y as i32, btn_size as i32, btn_size as i32, group_color.0, group_color.1, group_color.2);
         // Clean selection box icon
         buffer.rect_outline((group_btn_x + 8.0) as i32, (group_btn_y + 8.0) as i32, 24, 24, 255, 255, 255);
@@ -2682,8 +3046,8 @@ pub fn run_game() -> Result<(), JsValue> {
                  // Spawn Worker Button
                  buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
                  // Plus icon
-                 buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, 0, 255, 0);
-                 buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, 0, 255, 0);
+                 buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, col_ui_green.0, col_ui_green.1, col_ui_green.2);
+                 buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, col_ui_green.0, col_ui_green.1, col_ui_green.2);
              } else if b.kind == BuildKind::Barracks.to_kind_id() {
                  // Train Warrior Button
                  buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 120, 40, 40);
@@ -2696,13 +3060,13 @@ pub fn run_game() -> Result<(), JsValue> {
             if any_unit_selected {
 
                  // Build button opens submenu
-                 let build_color = if gs.build_menu_open { (0, 200, 0) } else { (0, 0, 150) };
+                 let build_color = if gs.build_menu_open { col_ui_green } else { (0, 0, 150) };
                  buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, build_color.0, build_color.1, build_color.2);
                  // Plus icon
-                 buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, 0, 255, 0);
-                 buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, 0, 255, 0);
+                 buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, col_ui_green.0, col_ui_green.1, col_ui_green.2);
+                 buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, col_ui_green.0, col_ui_green.1, col_ui_green.2);
 
-                 if gs.build_menu_open {
+                if gs.build_menu_open {
                      let options = [
                          (BuildKind::Wall, (150u8, 150u8, 150u8)),
                          (BuildKind::Farm, (50u8, 120u8, 50u8)),
@@ -2710,8 +3074,25 @@ pub fn run_game() -> Result<(), JsValue> {
                          (BuildKind::Tower, (120u8, 120u8, 140u8)),
                          (BuildKind::Barracks, (180u8, 80u8, 80u8)),
                      ];
+                        let menu_gap = 10.0; // uniform spacing with other vertical menus
+                    // Background panel matching footer color, sized to fit options with top padding; bottom aligns to the build button
+                    let menu_height = options.len() as f32 * (btn_size + menu_gap) - menu_gap;
+                    let menu_top = home_btn_y - menu_height;
+                    let top_pad = 20.0; // extra top padding
+                    let side_pad = 10.0; // balanced horizontal padding
+                    let panel_w = btn_size + side_pad * 2.0;
+                    let panel_x = 10.0 - side_pad;
+                    let panel_y = menu_top - top_pad;
+                    let panel_h = menu_height + top_pad; // no extra bottom pad so it stops at the build button
+                    buffer.rect(
+                        panel_x as i32,
+                        panel_y as i32,
+                        panel_w as i32,
+                        panel_h as i32,
+                        40, 40, 40
+                    );
                      for (idx, (kind, color)) in options.iter().enumerate() {
-                         let opt_y = home_btn_y - ((idx as f32 + 1.0) * (btn_size + 6.0));
+                        let opt_y = home_btn_y - ((idx as f32 + 1.0) * (btn_size + menu_gap));
                          let affordable = gs.resources.has(&kind.cost());
                          
                          // Highlight selected build type
@@ -2720,8 +3101,12 @@ pub fn run_game() -> Result<(), JsValue> {
                          let mut draw_color = if affordable { *color } else { (color.0 / 2, color.1 / 2, color.2 / 2) };
                          
                          if is_active {
-                             // Make it brighter or add border indicator
-                             draw_color = (draw_color.0.saturating_add(50), draw_color.1.saturating_add(50), draw_color.2.saturating_add(50));
+                             // Use green background for active wall button as requested
+                             if *kind == BuildKind::Wall {
+                                 draw_color = col_ui_green;
+                             } else {
+                                 draw_color = (draw_color.0.saturating_add(50), draw_color.1.saturating_add(50), draw_color.2.saturating_add(50));
+                             }
                          }
 
                          buffer.rect(10, opt_y as i32, btn_size as i32, btn_size as i32, draw_color.0, draw_color.1, draw_color.2);
@@ -2733,10 +3118,19 @@ pub fn run_game() -> Result<(), JsValue> {
                          // Tiny icon per type
                          match kind {
                              BuildKind::Wall => {
-                                 buffer.rect(16, (opt_y + 8.0) as i32, 8, 8, 200, 200, 200);
-                                 buffer.rect(28, (opt_y + 8.0) as i32, 8, 8, 180, 180, 180);
-                                 buffer.rect(16, (opt_y + 20.0) as i32, 8, 8, 180, 180, 180);
-                                 buffer.rect(28, (opt_y + 20.0) as i32, 8, 8, 200, 200, 200);
+                                 // Draw blue wall icon (centered)
+                                 let icon_size = 20.0;
+                                 let ix = 10.0 + (btn_size - icon_size)/2.0;
+                                 let iy = opt_y + (btn_size - icon_size)/2.0;
+                                 let gap = 2.0;
+                                 let sq = (icon_size - gap)/2.0;
+                                 let g = gap;
+                                 
+                                 let (c1, c2) = (col_player_wall_1, col_player_wall_2);
+                                 buffer.rect(ix as i32, iy as i32, sq as i32, sq as i32, c1.0, c1.1, c1.2);
+                                 buffer.rect((ix + sq + g) as i32, iy as i32, sq as i32, sq as i32, c2.0, c2.1, c2.2);
+                                 buffer.rect(ix as i32, (iy + sq + g) as i32, sq as i32, sq as i32, c2.0, c2.1, c2.2);
+                                 buffer.rect((ix + sq + g) as i32, (iy + sq + g) as i32, sq as i32, sq as i32, c1.0, c1.1, c1.2);
                              },
                              BuildKind::Farm => {
                                  buffer.rect(18, (opt_y + 10.0) as i32, 24, 12, 80, 160, 80);
@@ -2777,33 +3171,55 @@ pub fn run_game() -> Result<(), JsValue> {
                  let del_btn_x = WIDTH as f32 - btn_size - 10.0;
                  let del_btn_y = home_btn_y;
                  
-                 // Red background (Blocky)
-                 buffer.rect(del_btn_x as i32, del_btn_y as i32, btn_size as i32, btn_size as i32, 200, 50, 50);
+                 // Blue background (Spawn Blue - same as left)
+                 buffer.rect(del_btn_x as i32, del_btn_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
                  
-                 // White Minus Sign (Thick, Blocky)
-                 buffer.rect((del_btn_x + 8.0) as i32, (del_btn_y + 17.0) as i32, 24, 6, 255, 255, 255);
+                 // Red Minus Sign (Thick, Blocky)
+                 buffer.rect((del_btn_x + 8.0) as i32, (del_btn_y + 17.0) as i32, 24, 6, col_ui_red.0, col_ui_red.1, col_ui_red.2);
+
+                 // Skull Menu (Vertical above delete button)
+                 if gs.show_delete_confirm {
+                   let pad = 10.0;
+                   let skull_btn_y = del_btn_y - btn_size - 10.0;
+                   // Background panel matching footer, with top pad and no bottom overhang
+                   let panel_w = btn_size + pad * 2.0;
+                   let panel_x = del_btn_x - pad;
+                   let panel_y = skull_btn_y - pad;
+                   let panel_h = btn_size + pad; // stops just above the delete button
+                   buffer.rect(panel_x as i32, panel_y as i32, panel_w as i32, panel_h as i32, 40, 40, 40);
+                    
+                    // Button Background (Red for danger/confirm)
+                    buffer.rect(del_btn_x as i32, skull_btn_y as i32, btn_size as i32, btn_size as i32, col_ui_red.0, col_ui_red.1, col_ui_red.2);
+                    
+                    // Skull Icon (Simplified)
+                    // Cranium (White)
+                    buffer.rect((del_btn_x + 10.0) as i32, (skull_btn_y + 8.0) as i32, 20, 16, 255, 255, 255);
+                    // Jaw
+                    buffer.rect((del_btn_x + 14.0) as i32, (skull_btn_y + 24.0) as i32, 12, 6, 255, 255, 255);
+                    // Eyes (Black)
+                    buffer.rect((del_btn_x + 14.0) as i32, (skull_btn_y + 14.0) as i32, 4, 4, 0, 0, 0);
+                    buffer.rect((del_btn_x + 22.0) as i32, (skull_btn_y + 14.0) as i32, 4, 4, 0, 0, 0);
+                 }
              }
         }
         
-        // --- CONFIRM/CANCEL BUTTONS (when wall placement ready) ---
-        if gs.build_mode && gs.wall_end.is_some() {
+        // --- CONFIRM/CANCEL BUTTONS (for wall or any pending build) ---
+        if (gs.build_mode && gs.wall_end.is_some()) || gs.pending_single_build.is_some() {
             // Confirm button (green) - right side
             let confirm_btn_x = WIDTH as f32 - btn_size - 60.0;
             let confirm_btn_y = home_btn_y;
-            buffer.rect(confirm_btn_x as i32, confirm_btn_y as i32, btn_size as i32, btn_size as i32, 0, 150, 0);
-            // Checkmark icon
-            buffer.rect((confirm_btn_x + 10.0) as i32, (confirm_btn_y + 20.0) as i32, 8, 4, 255, 255, 255);
-            buffer.rect((confirm_btn_x + 16.0) as i32, (confirm_btn_y + 10.0) as i32, 4, 18, 255, 255, 255);
+            buffer.rect(confirm_btn_x as i32, confirm_btn_y as i32, btn_size as i32, btn_size as i32, col_ui_green.0, col_ui_green.1, col_ui_green.2);
+            // Plus icon (White) - Replaced Checkmark
+            buffer.rect((confirm_btn_x + 8.0) as i32, (confirm_btn_y + 17.0) as i32, 24, 6, 255, 255, 255);
+            buffer.rect((confirm_btn_x + 17.0) as i32, (confirm_btn_y + 8.0) as i32, 6, 24, 255, 255, 255);
             
             // Cancel button (red) - right of confirm
             let cancel_btn_x = WIDTH as f32 - btn_size - 10.0;
             let cancel_btn_y = home_btn_y;
-            buffer.rect(cancel_btn_x as i32, cancel_btn_y as i32, btn_size as i32, btn_size as i32, 150, 0, 0);
-            // X icon
-            buffer.rect((cancel_btn_x + 12.0) as i32, (cancel_btn_y + 10.0) as i32, 16, 4, 255, 255, 255);
-            buffer.rect((cancel_btn_x + 12.0) as i32, (cancel_btn_y + 26.0) as i32, 16, 4, 255, 255, 255);
-            buffer.rect((cancel_btn_x + 12.0) as i32, (cancel_btn_y + 10.0) as i32, 4, 20, 255, 255, 255);
-            buffer.rect((cancel_btn_x + 24.0) as i32, (cancel_btn_y + 10.0) as i32, 4, 20, 255, 255, 255);
+            buffer.rect(cancel_btn_x as i32, cancel_btn_y as i32, btn_size as i32, btn_size as i32, col_ui_red.0, col_ui_red.1, col_ui_red.2);
+            
+            // White Minus icon (Thick)
+            buffer.rect((cancel_btn_x + 8.0) as i32, (cancel_btn_y + 17.0) as i32, 24, 6, 255, 255, 255);
         }
         
         // --- BUILD MODE INDICATOR ---

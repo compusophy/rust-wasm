@@ -164,6 +164,16 @@ struct BuildTask {
 }
 
 #[derive(Clone, Copy)]
+struct TrainTask {
+    owner_id: i32,
+    kind: u8,
+    progress: f32,
+    chunk_x: i32,
+    chunk_y: i32,
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct GatherTask {
     kind: u8,
     target_x: i32,
@@ -179,6 +189,7 @@ struct GlobalState {
     resources: HashMap<i32, Resources>,
     pop_cap: HashMap<i32, i32>,
     building_progress: HashMap<(i32, i32), BuildTask>, // (tile_x, tile_y) -> task
+    training_tasks: Vec<TrainTask>,
     gather_tasks: HashMap<(i32, usize), GatherTask>, // (owner_id, unit_idx)
     buildings: Vec<BuildingDTO>,
 }
@@ -193,6 +204,7 @@ impl GlobalState {
             resources: HashMap::new(),
             pop_cap: HashMap::new(),
             building_progress: HashMap::new(),
+            training_tasks: Vec::new(),
             gather_tasks: HashMap::new(),
             buildings: Vec::new(),
         }
@@ -413,6 +425,7 @@ async fn main() {
                 }
 
                 let mut to_spawn: Vec<BuildTask> = Vec::new();
+                let mut to_spawn_units: Vec<TrainTask> = Vec::new();
                 let mut resource_updates: Vec<(i32, Resources, i32, i32)> = Vec::new();
                 let mut shots: Vec<(f32, f32, f32, f32, i32)> = Vec::new(); // shot with owner
                 let mut unit_hp_updates: Vec<(i32, usize, f32)> = Vec::new();
@@ -431,8 +444,38 @@ async fn main() {
                     if let Ok(mut gs) = state_clone.try_lock() {
                         // println!("[TRACE] Tick {} Locked", tick_count);
                         let mut finished = Vec::new();
+                        // Snapshot worker positions to avoid borrowing conflicts while mutating build progress.
+                        let mut worker_positions: HashMap<i32, Vec<(f32, f32)>> = HashMap::new();
+                        for (owner, units) in gs.units.iter() {
+                            for u in units {
+                                if u.kind == 0 {
+                                    worker_positions.entry(*owner).or_default().push((u.x, u.y));
+                                }
+                            }
+                        }
+
                         for (key, task) in gs.building_progress.iter_mut() {
-                            task.progress += 0.12; // ~1.6s build; adjust as needed
+                            // Require at least one friendly worker near the build site to advance progress.
+                            let bx = task.tile_x as f32 * TILE_SIZE + TILE_SIZE / 2.0;
+                            let by = task.tile_y as f32 * TILE_SIZE + TILE_SIZE / 2.0;
+                            let mut worker_count = 0usize;
+                            if let Some(units) = worker_positions.get(&task.owner_id) {
+                                for (ux, uy) in units {
+                                    let dx = *ux - bx;
+                                    let dy = *uy - by;
+                                    // Allow ~1.5 tiles radius for building
+                                    if (dx*dx + dy*dy) <= (TILE_SIZE * 1.5).powi(2) {
+                                        worker_count += 1;
+                                    }
+                                }
+                            }
+                            if worker_count == 0 {
+                                continue; // No worker in range; pause build progress.
+                            }
+
+                            // Scale progress with nearby workers (diminishing cap at 4 workers)
+                            let effective_workers = worker_count.min(4) as f32;
+                            task.progress += 0.12 * effective_workers; // base ~1.6s per worker, faster with helpers
                         // Ignored result to avoid panic on empty receivers
                         let _ = tx_clone.send(serde_json::to_string(&GameMessage::BuildProgress {
                             tile_x: task.tile_x,
@@ -448,6 +491,20 @@ async fn main() {
                         for k in finished {
                             gs.building_progress.remove(&k);
                         }
+                        
+                        // Unit Training Progress
+                        let mut finished_train = Vec::new();
+                        for (idx, task) in gs.training_tasks.iter_mut().enumerate() {
+                            task.progress += 0.05; // 4s training
+                            if task.progress >= 1.0 {
+                                finished_train.push(idx);
+                                to_spawn_units.push(*task);
+                            }
+                        }
+                        for idx in finished_train.iter().rev() {
+                            gs.training_tasks.remove(*idx);
+                        }
+                        
                         gather_tasks = gs.gather_tasks.iter().map(|((owner, _), g)| (*owner, *g)).collect();
                         units_snapshot = gs.units.iter()
                             .flat_map(|(owner, us)| us.iter().enumerate().map(move |(i, u)| (*owner, i, u.x, u.y, u.kind)))
@@ -627,6 +684,54 @@ async fn main() {
                             });
                 }
 
+                for task in to_spawn_units {
+                    // Acquire lock once
+                    let mut gs = state_clone.lock().await;
+                    let units = gs.units.entry(task.owner_id).or_insert(Vec::new());
+                    let next_idx = units.len();
+                    
+                    let tile_size = 16.0;
+                    let chunk_size = 32.0;
+                    let mid = chunk_size / 2.0;
+                    let tc_tile_x = task.chunk_x as f32 * chunk_size + mid;
+                    let tc_tile_y = task.chunk_y as f32 * chunk_size + mid;
+                    
+                    let col = (next_idx % 3) as f32;
+                    let row = (next_idx / 3) as f32;
+                    let spawn_x = (tc_tile_x * tile_size) + (col * tile_size);
+                    let spawn_y = (tc_tile_y * tile_size) + tile_size * 2.0 + (row * tile_size);
+                    
+                    // Update Memory
+                    units.push(UnitState { x: spawn_x, y: spawn_y, hp: WORKER_HP, kind: task.kind });
+                    drop(gs); // Release lock before await DB/Send
+
+                    // DB Insert
+                    if let Some(p) = &pool_clone {
+                        let _ = sqlx::query("INSERT INTO units (owner_id, unit_idx, x, y) VALUES ($1, $2, $3, $4)")
+                            .bind(task.owner_id)
+                            .bind(next_idx as i32)
+                            .bind(spawn_x)
+                            .bind(spawn_y)
+                            .execute(p)
+                            .await;
+                    }
+
+                    // Broadcast
+                    let msg = GameMessage::UnitSpawned {
+                        unit: UnitDTO {
+                            owner_id: task.owner_id,
+                            unit_idx: next_idx,
+                            x: spawn_x,
+                            y: spawn_y,
+                            kind: task.kind,
+                            hp: WORKER_HP,
+                        }
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = tx_clone.send(json);
+                    }
+                }
+
                 for (pid, res, cap, used) in resource_updates {
                     if let Ok(json) = serde_json::to_string(&GameMessage::ResourceUpdate {
                         player_id: pid,
@@ -652,7 +757,7 @@ async fn main() {
                 // Broadcast pop/resource updates after deaths
                 {
                     // Use try_lock for pop updates
-                    if let Ok(mut gs) = state_clone.try_lock() {
+                    if let Ok(gs) = state_clone.try_lock() {
                         for owner in pop_updates {
                             let pop_used = gs.units.get(&owner).map(|u| u.len() as i32).unwrap_or(0);
                             let pop_cap = *gs.pop_cap.get(&owner).unwrap_or(&default_pop_cap());
@@ -1433,7 +1538,7 @@ async fn handle_connection(
                         },
                         GameMessage::SpawnUnit => {
                             // Handle Spawn
-                            let (chunk_x, chunk_y, next_idx, unit_count) = {
+                            let (chunk_x, chunk_y, unit_count) = {
                                 if let Ok(mut gs) = recv_state.try_lock() {
                                     // Separate borrows: First get player coords (values only)
                                     let player_coords = gs.players.get(&player_id).map(|p| (p.chunk_x, p.chunk_y));
@@ -1441,12 +1546,12 @@ async fn handle_connection(
                                     if let Some((cx, cy)) = player_coords {
                                         // Now mutable borrow is safe
                                         let units = gs.units.entry(player_id).or_insert(Vec::new());
-                                        (cx, cy, units.len(), units.len())
+                                        (cx, cy, units.len())
                                     } else {
-                                        (0, 0, 0, 0)
+                                        (0, 0, 0)
                                     }
                                 } else {
-                                    (0, 0, 0, 0)
+                                    (0, 0, 0)
                                 }
                             };
                             
@@ -1473,58 +1578,20 @@ async fn handle_connection(
                                     continue;
                                 }
                             }
-                            
-                            // Calculate Spawn Pos (Near Town Center)
-                            // ... (omitted for brevity, same logic) ...
-                            let chunk_size = 32.0;
-                            let tile_size = 16.0;
-                            let mid = chunk_size / 2.0;
-                            
-                            let tc_tile_x = chunk_x as f32 * chunk_size + mid;
-                            let tc_tile_y = chunk_y as f32 * chunk_size + mid;
-                            
-                            let tc_world_x = tc_tile_x * tile_size;
-                            let tc_world_y = tc_tile_y * tile_size;
-                            
-                            let col = (next_idx % 3) as f32;
-                            let row = (next_idx / 3) as f32;
-                            let spawn_x = tc_world_x + (col * tile_size);
-                            let spawn_y = tc_world_y + tile_size * 2.0 + (row * tile_size);
-                            
-                            // 1. Update DB
-                            if let Some(p) = &recv_pool {
-                                let _ = sqlx::query("INSERT INTO units (owner_id, unit_idx, x, y) VALUES ($1, $2, $3, $4)")
-                                    .bind(player_id)
-                                    .bind(next_idx as i32)
-                                    .bind(spawn_x)
-                                    .bind(spawn_y)
-                                    .execute(p)
-                                    .await;
-                            }
-                            
-                            // 2. Update Memory
+                            // QUEUE TRAINING INSTEAD OF INSTANT SPAWN
                             {
                                 if let Ok(mut gs) = recv_state.try_lock() {
-                                    let entry = gs.units.entry(player_id).or_insert(Vec::new());
-                                    entry.push(UnitState { x: spawn_x, y: spawn_y, hp: WORKER_HP, kind: 0 });
+                                    gs.training_tasks.push(TrainTask {
+                                        owner_id: player_id,
+                                        kind: 0, // Worker
+                                        progress: 0.0,
+                                        chunk_x,
+                                        chunk_y,
+                                    });
                                 }
                             }
                             
-                            // 3. Broadcast
-                            let new_unit_msg = serde_json::to_string(&GameMessage::UnitSpawned {
-                                unit: UnitDTO {
-                                    owner_id: player_id,
-                                    unit_idx: next_idx,
-                                    x: spawn_x,
-                                    y: spawn_y,
-                                    kind: 0,
-                                    hp: WORKER_HP,
-                                }
-                            }).unwrap();
-                            
-                            let _ = tx.send(new_unit_msg);
-
-                            // 4. Broadcast resource update
+                            // Broadcast resource update (since we spent food)
                             let mut res_msg = None;
                             if let Ok(gs) = recv_state.try_lock() {
                                 if let Some(res) = gs.resources.get(&player_id) {
@@ -1541,14 +1608,22 @@ async fn handle_connection(
                         },
                         GameMessage::DeleteUnit { unit_idx } => {
                             let mut pid_to_update = None;
-                            {
-                                if let Ok(mut gs) = recv_state.try_lock() {
+                            if let Ok(mut gs) = recv_state.try_lock() {
+                                let mut refund_food = false;
+                                {
                                     if let Some(units) = gs.units.get_mut(&player_id) {
                                         // Unit idx in message is the player-specific index
                                         if unit_idx < units.len() {
+                                            refund_food = units[unit_idx].kind == 0; // Worker
                                             units.remove(unit_idx);
                                             pid_to_update = Some(player_id);
                                         }
+                                    }
+                                }
+
+                                if refund_food {
+                                    if let Some(res) = gs.resources.get_mut(&player_id) {
+                                        res.food += COST_WORKER.food;
                                     }
                                 }
                             }
