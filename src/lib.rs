@@ -910,15 +910,18 @@ impl GameState {
                      if ready_to_build {
                          // Check if construction already started (progress exists)
                          let already_building = self.server_progress.contains_key(&(tx, ty));
-                         if !already_building {
-                             // Send Build Command
-                             if let Some(ws) = &self.socket {
-                                let msg = GameMessage::Build { kind: BuildKind::Wall.to_kind_id(), tile_x: tx, tile_y: ty };
-                                if let Ok(json) = serde_json::to_string(&msg) {
-                                    let _ = ws.send_with_str(&json);
-                                }
-                             }
-                         }
+                        if !already_building {
+                            // Optimistically mark progress to avoid duplicate Build sends during network latency.
+                            self.server_progress.insert((tx, ty), TileProgress { progress: 0.0, kind: BuildKind::Wall.to_kind_id() });
+                            
+                            // Send Build Command
+                            if let Some(ws) = &self.socket {
+                               let msg = GameMessage::Build { kind: BuildKind::Wall.to_kind_id(), tile_x: tx, tile_y: ty };
+                               if let Ok(json) = serde_json::to_string(&msg) {
+                                   let _ = ws.send_with_str(&json);
+                               }
+                            }
+                        }
                      }
                  }
              }
@@ -3150,8 +3153,8 @@ pub fn run_game() -> Result<(), JsValue> {
 
                  // TC menu (vertical) when open
                  if gs.tc_menu_open {
-                     let menu_gap = 10.0;
-                     let top_pad = 0.0; // reduce extra top padding
+                    let menu_gap = 10.0;
+                    let top_pad = 10.0; // add breathing room above the menu
                      let side_pad = 10.0;
                      let menu_height = btn_size;
                      let opt_y = home_btn_y - (btn_size + menu_gap);

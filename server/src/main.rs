@@ -1255,12 +1255,16 @@ async fn handle_connection(
         }
         
         if let (Some(ps), Some(us), Some(bs)) = (db_players, db_units, db_buildings) {
-            // Prefer in-memory buildings if available (preserves damage state)
-            let final_buildings = if gs.buildings.is_empty() {
-                bs
-            } else {
-                gs.buildings.clone()
-            };
+            // Merge DB buildings into in-memory cache so restarts still load persisted structures.
+            // Prefer DB data for tiles we already have (overwrites temp/random IDs), keep any extra cached state otherwise.
+            for b in bs {
+                if let Some(idx) = gs.buildings.iter().position(|g| g.tile_x == b.tile_x && g.tile_y == b.tile_y) {
+                    gs.buildings[idx] = b;
+                } else {
+                    gs.buildings.push(b);
+                }
+            }
+            let final_buildings = gs.buildings.clone();
             (ps, us, final_buildings)
         } else {
         let existing_players: Vec<PlayerInfo> = gs.players.values().cloned().collect();
@@ -1660,31 +1664,69 @@ async fn handle_connection(
                                     continue;
                                 }
                             }
-                            // QUEUE TRAINING INSTEAD OF INSTANT SPAWN
+                            // INSTANT SPAWN (no training delay)
+                            let mut spawned: Option<(f32, f32, usize)> = None;
                             {
                                 if let Ok(mut gs) = recv_state.try_lock() {
-                                    gs.training_tasks.push(TrainTask {
+                                    let units = gs.units.entry(player_id).or_insert(Vec::new());
+                                    let next_idx = units.len();
+                                    
+                                    let tile_size = 16.0;
+                                    let chunk_size = 32.0;
+                                    let mid = chunk_size / 2.0;
+                                    let tc_tile_x = chunk_x as f32 * chunk_size + mid;
+                                    let tc_tile_y = chunk_y as f32 * chunk_size + mid;
+                                    
+                                    let col = (next_idx % 3) as f32;
+                                    let row = (next_idx / 3) as f32;
+                                    let spawn_x = (tc_tile_x * tile_size) + (col * tile_size);
+                                    let spawn_y = (tc_tile_y * tile_size) + tile_size * 2.0 + (row * tile_size);
+                                    
+                                    units.push(UnitState { x: spawn_x, y: spawn_y, hp: WORKER_HP, kind: 0 });
+                                    spawned = Some((spawn_x, spawn_y, next_idx));
+                                }
+                            }
+
+                            if let Some((spawn_x, spawn_y, next_idx)) = spawned {
+                                // Persist to DB
+                                if let Some(p) = &recv_pool {
+                                    let _ = sqlx::query("INSERT INTO units (owner_id, unit_idx, x, y) VALUES ($1, $2, $3, $4)")
+                                        .bind(player_id)
+                                        .bind(next_idx as i32)
+                                        .bind(spawn_x)
+                                        .bind(spawn_y)
+                                        .execute(p)
+                                        .await;
+                                }
+
+                                // Broadcast spawn
+                                let msg = GameMessage::UnitSpawned {
+                                    unit: UnitDTO {
                                         owner_id: player_id,
-                                        kind: 0, // Worker
-                                        progress: 0.0,
-                                        chunk_x,
-                                        chunk_y,
-                                    });
-                                }
-                            }
-                            
-                            // Broadcast resource update (since we spent food)
-                            let mut res_msg = None;
-                            if let Ok(gs) = recv_state.try_lock() {
-                                if let Some(res) = gs.resources.get(&player_id) {
-                                    let pop_cap = *gs.pop_cap.get(&player_id).unwrap_or(&default_pop_cap());
-                                    let pop_used = gs.units.get(&player_id).map(|u| u.len() as i32).unwrap_or(0);
-                                    res_msg = Some(GameMessage::ResourceUpdate { player_id, resources: *res, pop_cap, pop_used });
-                                }
-                            }
-                            if let Some(msg) = res_msg {
+                                        unit_idx: next_idx,
+                                        x: spawn_x,
+                                        y: spawn_y,
+                                        kind: 0,
+                                        hp: WORKER_HP,
+                                    }
+                                };
                                 if let Ok(json) = serde_json::to_string(&msg) {
                                     let _ = tx.send(json);
+                                }
+
+                                // Broadcast resource update (already spent; include updated pop_used)
+                                let mut res_msg = None;
+                                if let Ok(gs) = recv_state.try_lock() {
+                                    if let Some(res) = gs.resources.get(&player_id) {
+                                        let pop_cap = *gs.pop_cap.get(&player_id).unwrap_or(&default_pop_cap());
+                                        let pop_used = gs.units.get(&player_id).map(|u| u.len() as i32).unwrap_or(0);
+                                        res_msg = Some(GameMessage::ResourceUpdate { player_id, resources: *res, pop_cap, pop_used });
+                                    }
+                                }
+                                if let Some(msg) = res_msg {
+                                    if let Ok(json) = serde_json::to_string(&msg) {
+                                        let _ = tx.send(json);
+                                    }
                                 }
                             }
                         },
