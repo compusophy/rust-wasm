@@ -105,7 +105,7 @@ impl Resources {
     }
 }
 
-const COST_WALL: Resources = Resources { wood: 1.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_WALL: Resources = Resources { wood: 1.0, stone: 5.0, gold: 0.0, food: 0.0 };
 const COST_FARM: Resources = Resources { wood: 30.0, stone: 0.0, gold: 0.0, food: 0.0 };
 const COST_HOUSE: Resources = Resources { wood: 25.0, stone: 0.0, gold: 0.0, food: 0.0 };
 const COST_TOWER: Resources = Resources { wood: 0.0, stone: 40.0, gold: 0.0, food: 0.0 };
@@ -303,8 +303,10 @@ impl GlobalState {
     }
 }
 
+const MIN_START_RES: Resources = Resources { wood: 200.0, stone: 160.0, gold: 60.0, food: 300.0 };
+
 fn default_resources() -> Resources {
-    Resources::new(150.0, 60.0, 60.0, 100.0)
+    MIN_START_RES
 }
 
 fn default_pop_cap() -> i32 {
@@ -339,11 +341,21 @@ async fn main() {
                     token VARCHAR NOT NULL UNIQUE,
                     chunk_x INT NOT NULL,
                     chunk_y INT NOT NULL,
+                    wood REAL DEFAULT 0,
+                    stone REAL DEFAULT 0,
+                    gold REAL DEFAULT 0,
+                    food REAL DEFAULT 0,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )"
             )
             .execute(valid_pool)
             .await;
+
+            // Backfill resource columns if they don't exist
+            let _ = sqlx::query("ALTER TABLE players ADD COLUMN IF NOT EXISTS wood REAL DEFAULT 0").execute(valid_pool).await;
+            let _ = sqlx::query("ALTER TABLE players ADD COLUMN IF NOT EXISTS stone REAL DEFAULT 0").execute(valid_pool).await;
+            let _ = sqlx::query("ALTER TABLE players ADD COLUMN IF NOT EXISTS gold REAL DEFAULT 0").execute(valid_pool).await;
+            let _ = sqlx::query("ALTER TABLE players ADD COLUMN IF NOT EXISTS food REAL DEFAULT 0").execute(valid_pool).await;
 
             let _ = sqlx::query(
                 "CREATE TABLE IF NOT EXISTS units (
@@ -433,6 +445,7 @@ async fn main() {
                 let mut pop_updates: Vec<i32> = Vec::new(); // owners needing pop recount
                 let mut building_hp_updates: Vec<(i32, i32, f32)> = Vec::new();
                 let mut building_deaths: Vec<(i32, i32, i32)> = Vec::new(); // tile_x, tile_y, owner
+                let mut canceled_builds: Vec<BuildTask> = Vec::new();
 
                 // Snapshot phase
                 let gather_tasks: Vec<(i32, GatherTask)>;
@@ -470,7 +483,19 @@ async fn main() {
                                 }
                             }
                             if worker_count == 0 {
-                                continue; // No worker in range; pause build progress.
+                                // No worker in range; cancel wall build and refund
+                                if task.kind == 1 {
+                                    // Notify clients to clear progress
+                                    let _ = tx_clone.send(serde_json::to_string(&GameMessage::BuildProgress {
+                                        tile_x: task.tile_x,
+                                        tile_y: task.tile_y,
+                                        kind: task.kind,
+                                        progress: -1.0,
+                                    }).unwrap_or_default());
+                                    canceled_builds.push(*task);
+                                    finished.push(*key); // remove from progress map
+                                }
+                                continue;
                             }
 
                             // Scale progress with nearby workers (diminishing cap at 4 workers)
@@ -684,6 +709,29 @@ async fn main() {
                             });
                 }
 
+                // Refund canceled builds (no worker present). Only walls are canceled above, but handle generically.
+                for task in canceled_builds {
+                    let cost = cost_for_kind(task.kind);
+                    if let Ok(mut gs) = state_clone.try_lock() {
+                        let entry = gs.resources.entry(task.owner_id).or_insert(default_resources());
+                        entry.wood += cost.wood;
+                        entry.stone += cost.stone;
+                        entry.gold += cost.gold;
+                        entry.food += cost.food;
+                        gs.building_progress.remove(&(task.tile_x, task.tile_y));
+                    }
+                    let gs = state_clone.lock().await;
+                    let res = *gs.resources.get(&task.owner_id).unwrap_or(&default_resources());
+                    let pop_cap = *gs.pop_cap.get(&task.owner_id).unwrap_or(&default_pop_cap());
+                    let pop_used = gs.units.get(&task.owner_id).map(|u| u.len() as i32).unwrap_or(0);
+                    let _ = tx_clone.send(serde_json::to_string(&GameMessage::ResourceUpdate {
+                        player_id: task.owner_id,
+                        resources: res,
+                        pop_cap,
+                        pop_used,
+                    }).unwrap_or_default());
+                }
+
                 for task in to_spawn_units {
                     // Acquire lock once
                     let mut gs = state_clone.lock().await;
@@ -740,6 +788,17 @@ async fn main() {
                         pop_used: used,
                     }) {
                         let _ = tx_clone.send(json);
+                    }
+                    // Persist resources to DB if available
+                    if let Some(p) = &pool_clone {
+                        let _ = sqlx::query("UPDATE players SET wood = $1, stone = $2, gold = $3, food = $4 WHERE id = $5")
+                            .bind(res.wood)
+                            .bind(res.stone)
+                            .bind(res.gold)
+                            .bind(res.food)
+                            .bind(pid)
+                            .execute(p)
+                            .await;
                     }
                 }
 
@@ -973,21 +1032,38 @@ async fn handle_connection(
     }
 
     // Authenticate or Register
-    let (player_id, chunk_x, chunk_y, token) = if let Some(p) = &pool {
+    let (player_id, chunk_x, chunk_y, token, res_from_db) = if let Some(p) = &pool {
         // DB MODE
         match client_token {
             Some(t) => {
-                let row = sqlx::query("SELECT id, chunk_x, chunk_y FROM players WHERE token = $1")
+                let row = sqlx::query("SELECT id, chunk_x, chunk_y, wood, stone, gold, food FROM players WHERE token = $1")
                     .bind(&t)
                     .fetch_optional(p)
                     .await;
                 
                 match row {
-                    Ok(Some(r)) => (r.get::<i32, _>("id"), r.get::<i32, _>("chunk_x"), r.get::<i32, _>("chunk_y"), t),
-                    _ => create_new_player(p).await // Invalid token or error -> New Player
+                    Ok(Some(r)) => (
+                        r.get::<i32, _>("id"),
+                        r.get::<i32, _>("chunk_x"),
+                        r.get::<i32, _>("chunk_y"),
+                        t,
+                        Some(Resources {
+                            wood: r.get::<f32, _>("wood"),
+                            stone: r.get::<f32, _>("stone"),
+                            gold: r.get::<f32, _>("gold"),
+                            food: r.get::<f32, _>("food"),
+                        })
+                    ),
+                    _ => {
+                        let (id, cx, cy, tok) = create_new_player(p).await;
+                        (id, cx, cy, tok, None)
+                    }
                 }
             },
-            None => create_new_player(p).await
+            None => {
+                let (id, cx, cy, tok) = create_new_player(p).await;
+                (id, cx, cy, tok, None)
+            }
         }
     } else {
         // MEMORY MODE (Fallback)
@@ -999,7 +1075,7 @@ async fn handle_connection(
                  // Found existing player in memory
                  // Re-calculate chunk pos based on ID
                  let (cx, cy) = GlobalState::assign_next_position(pid);
-                 (pid, cx, cy, t.clone())
+                 (pid, cx, cy, t.clone(), None)
              } else {
                  // New player
                  let id = gs.next_id;
@@ -1007,7 +1083,7 @@ async fn handle_connection(
                  let (cx, cy) = GlobalState::assign_next_position(id);
                  let new_token = Uuid::new_v4().to_string();
                  gs.tokens.insert(new_token.clone(), id);
-                 (id, cx, cy, new_token)
+                 (id, cx, cy, new_token, None)
              }
         } else {
             // New player (No token sent)
@@ -1016,7 +1092,7 @@ async fn handle_connection(
             let (cx, cy) = GlobalState::assign_next_position(id);
             let new_token = Uuid::new_v4().to_string();
             gs.tokens.insert(new_token.clone(), id);
-            (id, cx, cy, new_token)
+            (id, cx, cy, new_token, None)
         }
     };
 
@@ -1141,8 +1217,14 @@ async fn handle_connection(
         
         gs.players.insert(player_id, PlayerInfo { id: player_id, chunk_x, chunk_y });
 
-        // Initialize economy if missing
-        gs.resources.entry(player_id).or_insert(default_resources());
+        // Initialize economy if missing, prefer DB-loaded resources, and ensure minimum starting resources
+        {
+            let entry = gs.resources.entry(player_id).or_insert(res_from_db.unwrap_or(default_resources()));
+            entry.wood = entry.wood.max(MIN_START_RES.wood);
+            entry.stone = entry.stone.max(MIN_START_RES.stone);
+            entry.gold = entry.gold.max(MIN_START_RES.gold);
+            entry.food = entry.food.max(MIN_START_RES.food);
+        }
         gs.pop_cap.entry(player_id).or_insert(default_pop_cap());
         
         // Handle Units
@@ -1668,15 +1750,18 @@ async fn handle_connection(
                         GameMessage::DeleteBuilding { tile_x, tile_y } => {
                             let mut destroyed = false;
                             let mut owner = 0;
-                            let mut is_house = false;
+                            let mut refund = default_resources();
+                            let mut do_refund = false;
                             
                             {
                                 if let Ok(mut gs) = recv_state.try_lock() {
                                     if let Some(idx) = gs.buildings.iter().position(|b| b.tile_x == tile_x && b.tile_y == tile_y) {
-                                        let b = &gs.buildings[idx];
+                                        let b = gs.buildings[idx].clone();
                                         if b.owner_id == player_id && b.kind != 0 { // Cannot delete Town Center (kind 0)
                                             owner = b.owner_id;
-                                            is_house = b.kind == 3;
+                                            let is_house = b.kind == 3;
+                                            refund = cost_for_kind(b.kind);
+                                            do_refund = true;
                                             gs.buildings.remove(idx);
                                             destroyed = true;
                                             
@@ -1702,16 +1787,23 @@ async fn handle_connection(
                                 // Broadcast Destroyed
                                 let _ = tx.send(serde_json::to_string(&GameMessage::BuildingDestroyed { tile_x, tile_y }).unwrap());
                                 
-                                // Broadcast Resource/Pop Update (if house)
-                                if is_house {
-                                    let gs = recv_state.lock().await;
-                                    let pop_used = gs.units.get(&owner).map(|u| u.len() as i32).unwrap_or(0);
-                                    let pop_cap = *gs.pop_cap.get(&owner).unwrap_or(&default_pop_cap());
-                                    let res = *gs.resources.get(&owner).unwrap_or(&default_resources());
-                                    let _ = tx.send(serde_json::to_string(&GameMessage::ResourceUpdate { 
-                                        player_id: owner, resources: res, pop_cap, pop_used 
-                                    }).unwrap());
+                                // Apply refund and broadcast Resource/Pop Update
+                                if do_refund {
+                                    if let Ok(mut gs) = recv_state.try_lock() {
+                                        let entry = gs.resources.entry(owner).or_insert(default_resources());
+                                        entry.wood += refund.wood;
+                                        entry.stone += refund.stone;
+                                        entry.gold += refund.gold;
+                                        entry.food += refund.food;
+                                    }
                                 }
+                                let gs = recv_state.lock().await;
+                                let pop_used = gs.units.get(&owner).map(|u| u.len() as i32).unwrap_or(0);
+                                let pop_cap = *gs.pop_cap.get(&owner).unwrap_or(&default_pop_cap());
+                                let res = *gs.resources.get(&owner).unwrap_or(&default_resources());
+                                let _ = tx.send(serde_json::to_string(&GameMessage::ResourceUpdate { 
+                                    player_id: owner, resources: res, pop_cap, pop_used 
+                                }).unwrap());
                             }
                         },
                         _ => {}
@@ -1755,10 +1847,14 @@ async fn create_new_player(pool: &Pool<Postgres>) -> (i32, i32, i32, String) {
     
     let (cx, cy) = GlobalState::assign_next_position(count as i32 + 1);
 
-    let rec = sqlx::query("INSERT INTO players (token, chunk_x, chunk_y) VALUES ($1, $2, $3) RETURNING id")
+    let rec = sqlx::query("INSERT INTO players (token, chunk_x, chunk_y, wood, stone, gold, food) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id")
         .bind(&token)
         .bind(cx)
         .bind(cy)
+        .bind(MIN_START_RES.wood)
+        .bind(MIN_START_RES.stone)
+        .bind(MIN_START_RES.gold)
+        .bind(MIN_START_RES.food)
         .fetch_one(pool)
         .await
         .expect("Failed to insert new player");

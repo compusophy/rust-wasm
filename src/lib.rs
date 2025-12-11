@@ -120,7 +120,7 @@ impl Resources {
 
 }
 
-const COST_WALL: Resources = Resources { wood: 1.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_WALL: Resources = Resources { wood: 1.0, stone: 5.0, gold: 0.0, food: 0.0 };
 const COST_FARM: Resources = Resources { wood: 30.0, stone: 0.0, gold: 0.0, food: 0.0 };
 const COST_HOUSE: Resources = Resources { wood: 25.0, stone: 0.0, gold: 0.0, food: 0.0 };
 const COST_TOWER: Resources = Resources { wood: 0.0, stone: 40.0, gold: 0.0, food: 0.0 };
@@ -423,6 +423,9 @@ struct GameState {
 
     // Training queue (optimistic, drained when UnitSpawned arrives)
     training_queue: Vec<f32>, // seconds remaining per queued worker
+
+    // Town Center menu
+    tc_menu_open: bool,
 }
 
 impl GameState {
@@ -431,7 +434,7 @@ impl GameState {
             chunks: HashMap::new(),
             units: Vec::new(),
             buildings: Vec::new(),
-            resources: Resources::new(150.0, 60.0, 60.0, 100.0),
+            resources: Resources::new(200.0, 160.0, 60.0, 300.0),
             pop_cap: 5,
             pop_used: 0,
             build_menu_open: false,
@@ -469,6 +472,7 @@ impl GameState {
             show_delete_confirm: false,
             pending_single_build: None,
             training_queue: Vec::new(),
+            tc_menu_open: false,
         };
 
         // Generate Initial Chunk (0,0)
@@ -914,8 +918,6 @@ impl GameState {
                                     let _ = ws.send_with_str(&json);
                                 }
                              }
-                            // Add dummy progress with known kind so we don't spam Build commands
-                            self.server_progress.insert((tx, ty), TileProgress { progress: 0.01, kind: BuildKind::Wall.to_kind_id() });
                          }
                      }
                  }
@@ -924,15 +926,6 @@ impl GameState {
         
         // --- GATHERING PROGRESS ---
         self.update_gathering(dt);
-        // --- TRAINING QUEUE (optimistic) ---
-        if !self.training_queue.is_empty() {
-            if let Some(front) = self.training_queue.first_mut() {
-                *front -= dt as f32;
-                if *front <= 0.0 {
-                    self.training_queue.remove(0);
-                }
-            }
-        }
         // --- TOWER SHOTS (server-driven; only decay TTL) ---
         for s in &mut self.tower_shots {
             s.ttl -= dt as f32;
@@ -1011,8 +1004,10 @@ impl GameState {
             ];
             for (idx, kind) in options.iter().enumerate() {
                 let opt_y = build_btn_y - ((idx as f32 + 1.0) * (btn_size + 6.0));
-                if screen_x >= build_btn_x && screen_x <= build_btn_x + btn_size &&
-                   screen_y >= opt_y && screen_y <= opt_y + btn_size {
+                    let affordable = self.resources.has(&kind.cost());
+                    if screen_x >= build_btn_x && screen_x <= build_btn_x + btn_size &&
+                       screen_y >= opt_y && screen_y <= opt_y + btn_size {
+                        if !affordable { return; }
                     if *kind == BuildKind::Wall {
                         self.selected_build = Some(BuildKind::Wall);
                         self.build_mode = true;
@@ -1035,6 +1030,26 @@ impl GameState {
                     }
                     return;
                 }
+            }
+        }
+
+        // 0b. Check Town Center Menu Options (Floating above footer, single button)
+        if self.tc_menu_open {
+            let menu_gap = 10.0;
+            let opt_y = build_btn_y - (btn_size + menu_gap);
+            let opt_x = build_btn_x;
+            if screen_x >= opt_x && screen_x <= opt_x + btn_size &&
+               screen_y >= opt_y && screen_y <= opt_y + btn_size {
+                if self.pop_used < self.pop_cap && self.can_afford(&COST_WORKER) {
+                    if let Some(ws) = &self.socket {
+                        let msg = GameMessage::SpawnUnit;
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            let _ = ws.send_with_str(&json);
+                        }
+                    }
+                }
+                self.tc_menu_open = false;
+                return;
             }
         }
         // Check Selected Unit/Building Icons (above footer, CENTERED) - click to deselect
@@ -1091,18 +1106,57 @@ impl GameState {
                 }
             }
         }
-        // Expand UI clickable area upward for floating menus (build submenu, skull confirm)
-        let mut ui_top = HEIGHT as f32 - footer_height;
+        // Handle skull confirm (above footer) even when not in footer region
         if self.show_delete_confirm {
-            ui_top -= btn_size + 10.0; // skull button above delete
+            let footer_height = 60.0;
+            let btn_size = 40.0;
+            let home_btn_y = HEIGHT as f32 - footer_height + (footer_height - btn_size) / 2.0;
+            let del_btn_x = WIDTH as f32 - btn_size - 10.0;
+            let del_btn_y = home_btn_y;
+            let skull_btn_y = del_btn_y - btn_size - 10.0;
+            if screen_x >= del_btn_x && screen_x <= del_btn_x + btn_size &&
+               screen_y >= skull_btn_y && screen_y <= skull_btn_y + btn_size {
+                // Confirm deletion
+                // Reuse existing entity_info resolution by re-running the footer delete logic
+                let my_id = if let Some(id) = self.my_id { id } else { return; };
+                let selected_units: Vec<_> = self.units.iter().enumerate().filter(|(_, u)| u.selected && u.owner_id == my_id).collect();
+                let selected_buildings: Vec<_> = self.buildings.iter().enumerate().filter(|(_, b)| b.selected && b.owner_id == my_id).collect();
+                let total_selected = selected_units.len() + selected_buildings.len();
+                if total_selected == 1 {
+                    let entity_info = if let Some((idx, _)) = selected_units.first() {
+                        Some((false, *idx))
+                    } else if let Some((idx, _b)) = selected_buildings.first() {
+                        Some((true, *idx))
+                    } else { None };
+                    if let Some((is_b, idx)) = entity_info {
+                        if let Some(ws) = &self.socket {
+                            let msg = if is_b {
+                                let b = &self.buildings[idx];
+                                GameMessage::DeleteBuilding { tile_x: b.tile_x, tile_y: b.tile_y }
+                            } else {
+                                // Calculate player-local unit index
+                                let mut my_idx = 0;
+                                for (k, u) in self.units.iter().enumerate() {
+                                    if u.owner_id == my_id {
+                                        if k == idx { break; }
+                                        my_idx += 1;
+                                    }
+                                }
+                                GameMessage::DeleteUnit { unit_idx: my_idx }
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = ws.send_with_str(&json);
+                            }
+                        }
+                    }
+                    self.show_delete_confirm = false;
+                    return;
+                }
+            }
         }
-        if self.build_menu_open {
-            let menu_gap = 10.0;
-            let menu_height = 5.0 * (btn_size + menu_gap); // number of options * spacing
-            ui_top -= menu_height;
-        }
-        
-        if screen_y > ui_top {
+
+        // Footer hit area only for the visible footer; floating menus should not block world clicks
+        if screen_y > HEIGHT as f32 - footer_height {
             // Click is in Footer
             
             // 1. Check Home Button (Center)
@@ -1169,22 +1223,13 @@ impl GameState {
             if selected_buildings.len() == 1 {
                 let (b_idx, b) = selected_buildings[0];
                 if b.kind == 0 {
-                    let spawn_btn_x = 10.0;
-                    let spawn_btn_y = home_btn_y;
+                    let tc_btn_x = 10.0;
+                    let tc_btn_y = home_btn_y;
                     
-                    if screen_x >= spawn_btn_x && screen_x <= spawn_btn_x + btn_size &&
-                       screen_y >= spawn_btn_y && screen_y <= spawn_btn_y + btn_size {
-                        // Resource + pop-cap gating (client-side optimistic, server authoritative)
-                        if self.pop_used >= self.pop_cap { return; }
-                        if !self.can_afford(&COST_WORKER) { return; }
-                        if let Some(ws) = &self.socket {
-                             let msg = GameMessage::SpawnUnit;
-                             if let Ok(json) = serde_json::to_string(&msg) {
-                                 let _ = ws.send_with_str(&json);
-                             }
-                        }
-                        // Show local training progress bar (assumes ~4s server training)
-                        self.training_queue.push(4.0);
+                    if screen_x >= tc_btn_x && screen_x <= tc_btn_x + btn_size &&
+                       screen_y >= tc_btn_y && screen_y <= tc_btn_y + btn_size {
+                        // Toggle TC menu instead of instant spawn
+                        self.tc_menu_open = !self.tc_menu_open;
                         return;
                     }
                 } else if b.kind == BuildKind::Barracks.to_kind_id() {
@@ -1365,6 +1410,11 @@ impl GameState {
         let clicked_tile_x = (wx / TILE_SIZE_BASE).floor() as i32;
         let clicked_tile_y = (wy / TILE_SIZE_BASE).floor() as i32;
         
+        // Close TC menu if TC not selected
+        if !self.buildings.iter().any(|b| b.owner_id == my_id && b.kind == 0 && b.selected) {
+            self.tc_menu_open = false;
+        }
+
         // Handle single-tile building placement (non-wall)
         if let Some(kind) = self.selected_build {
             if kind != BuildKind::Wall {
@@ -1467,6 +1517,8 @@ impl GameState {
         let mut clicked_unit_kind: Option<u8> = None;
         let mut clicked_unit = false;
         
+        let tc_selected = self.buildings.iter().any(|b| b.owner_id == my_id && b.kind == 0 && b.selected);
+
         // 1. Try Select Unit
         for unit in &mut self.units {
             if unit.owner_id != my_id { continue; }
@@ -1475,6 +1527,12 @@ impl GameState {
             let dy = (unit.y - wy).abs();
             
             if dx < 10.0 && dy < 10.0 {
+                if tc_selected {
+                    // Town Center cannot be grouped; deselect it when picking units
+                    for b in &mut self.buildings {
+                        if b.owner_id == my_id && b.kind == 0 { b.selected = false; }
+                    }
+                }
                 unit.selected = !unit.selected;
                 clicked_unit = true;
                 clicked_unit_kind = Some(unit.kind);
@@ -1499,33 +1557,57 @@ impl GameState {
             let mut clicked_building = false;
             let mut farm_task = None;
             
-            for (_i, b) in self.buildings.iter_mut().enumerate() {
-                if b.owner_id != my_id { continue; }
+            for idx in 0..self.buildings.len() {
+                let mut deselect_tc = false;
+                let mut select_tc = false;
+                let mut toggle_other = false;
+                let (tile_left, tile_top, tile_right, tile_bottom, kind);
+                {
+                    let b = &self.buildings[idx];
+                    if b.owner_id != my_id { continue; }
+                    tile_left = b.tile_x as f32 * TILE_SIZE_BASE;
+                    tile_top = b.tile_y as f32 * TILE_SIZE_BASE;
+                    tile_right = tile_left + TILE_SIZE_BASE;
+                    tile_bottom = tile_top + TILE_SIZE_BASE;
+                    kind = b.kind;
+                }
                 
                 // Buildings use TOP-LEFT based positioning (same as tiles)
-                let tile_left = b.tile_x as f32 * TILE_SIZE_BASE;
-                let tile_top = b.tile_y as f32 * TILE_SIZE_BASE;
-                let tile_right = tile_left + TILE_SIZE_BASE;
-                let tile_bottom = tile_top + TILE_SIZE_BASE;
-                
                 if wx >= tile_left && wx <= tile_right &&
                    wy >= tile_top && wy <= tile_bottom {
                        // If units are selected, allow assigning farm work
                        let any_unit_selected = self.units.iter().any(|u| u.selected && u.owner_id == my_id);
-                       if any_unit_selected && b.kind == BuildKind::Farm.to_kind_id() {
-                           farm_task = Some((b.tile_x, b.tile_y));
+                       if any_unit_selected && kind == BuildKind::Farm.to_kind_id() {
+                           farm_task = Some((
+                               (tile_left / TILE_SIZE_BASE) as i32,
+                               (tile_top / TILE_SIZE_BASE) as i32
+                           ));
                            break;
                        }
-                       // Toggle selection
-                       b.selected = !b.selected;
+                       // Selection rules:
+                       if kind == 0 {
+                           // Town Center is exclusive: clear all other selections and select only TC
+                           deselect_tc = true; // reuse to clear others
+                           select_tc = true;
+                       } else {
+                           // If TC was selected alone, drop it when selecting another entity
+                           if tc_selected {
+                               deselect_tc = true;
+                           }
+                           toggle_other = true;
+                       }
+                       // Apply selection mutations now that borrows are released
+                       if deselect_tc {
+                           for u in &mut self.units { u.selected = false; }
+                           for other_b in &mut self.buildings { other_b.selected = false; }
+                       }
+                       if select_tc {
+                           if let Some(bmut) = self.buildings.get_mut(idx) { bmut.selected = true; }
+                       }
+                       if toggle_other {
+                           if let Some(bmut) = self.buildings.get_mut(idx) { bmut.selected = !bmut.selected; }
+                       }
                        clicked_building = true;
-                       
-                       // If we just selected this building, deselect everything else? 
-                       // Current unit logic is toggle. Let's keep toggle for now to support "adding" to selection via clicking?
-                       // Actually, unit logic (line 1136) toggles.
-                       // But if I click a building, should I deselect units?
-                       // The previous code did: for u in &mut self.units { u.selected = false; }
-                       // I will REMOVE that to allow mixed selection as requested.
                        break;
                    }
             }
@@ -1749,9 +1831,26 @@ impl GameState {
     fn can_afford(&self, cost: &Resources) -> bool {
         self.resources.has(cost)
     }
+
+    fn can_afford_total(&self, cost: &Resources, count: usize) -> bool {
+        if count == 0 { return true; }
+        let total = Resources {
+            wood: cost.wood * count as f32,
+            stone: cost.stone * count as f32,
+            gold: cost.gold * count as f32,
+            food: cost.food * count as f32,
+        };
+        self.resources.has(&total)
+    }
     
     fn confirm_wall_build(&mut self) {
         if self.wall_preview.is_empty() {
+            self.cancel_wall_build();
+            return;
+        }
+        // Check resources for all previewed walls
+        let wall_count = self.wall_preview.len();
+        if !self.can_afford_total(&COST_WALL, wall_count) {
             self.cancel_wall_build();
             return;
         }
@@ -2314,7 +2413,11 @@ pub fn run_game() -> Result<(), JsValue> {
                             log("New building spawned!");
                         },
                         GameMessage::BuildProgress { tile_x, tile_y, kind, progress } => {
-                            state.server_progress.insert((tile_x, tile_y), TileProgress { progress, kind });
+                            if progress < 0.0 {
+                                state.server_progress.remove(&(tile_x, tile_y));
+                            } else {
+                                state.server_progress.insert((tile_x, tile_y), TileProgress { progress, kind });
+                            }
                         },
                         GameMessage::UnitHp { owner_id, unit_idx, hp } => {
                             let mut count = 0;
@@ -2818,25 +2921,48 @@ pub fn run_game() -> Result<(), JsValue> {
         // --- BUILD GHOSTS + PROGRESS BARS (server-driven) ---
         for ((tx, ty), prog) in &gs.server_progress {
             // Draw ghost footprint using kind color scaled by progress
-            let base_color = match prog.kind {
-                0 => (0, 0, 150),      // Town Center
-                1 => (150, 150, 150),  // Wall
-                2 => (80, 160, 80),    // Farm
-                3 => (220, 200, 140),  // House
-                4 => (160, 160, 180),  // Tower
-                5 => (180, 80, 80),    // Barracks
-                _ => (120, 120, 120),
-            };
-            let factor = (0.3 + prog.progress.clamp(0.0, 1.0) * 0.7).min(1.0);
-            let cr = (base_color.0 as f32 * factor) as i32;
-            let cg = (base_color.1 as f32 * factor) as i32;
-            let cb = (base_color.2 as f32 * factor) as i32;
             let tile_world_x = *tx as f32 * TILE_SIZE_BASE;
             let tile_world_y = *ty as f32 * TILE_SIZE_BASE;
             let sx = (tile_world_x - cam_x) * zoom + screen_center_x;
             let sy = (tile_world_y - cam_y) * zoom + screen_center_y;
-            buffer.rect(sx as i32, sy as i32, tile_size.ceil() as i32, tile_size.ceil() as i32, cr as u8, cg as u8, cb as u8);
-            buffer.rect_outline(sx as i32, sy as i32, tile_size.ceil() as i32, tile_size.ceil() as i32, 20, 20, 20);
+
+            if prog.kind == 1 {
+                // Wall: fade-in bricks using wall palette
+                let factor = (0.2 + prog.progress.clamp(0.0, 1.0) * 0.8).min(1.0);
+                let bricks = [
+                    (col_player_wall_1, 0.0, 0.0),
+                    (col_player_wall_2, tile_size / 2.0, 0.0),
+                    (col_player_wall_2, 0.0, tile_size / 2.0),
+                    (col_player_wall_1, tile_size / 2.0, tile_size / 2.0),
+                ];
+                for (c, ox, oy) in bricks {
+                    let cr = (c.0 as f32 * factor) as u8;
+                    let cg = (c.1 as f32 * factor) as u8;
+                    let cb = (c.2 as f32 * factor) as u8;
+                    buffer.rect(
+                        (sx + ox) as i32,
+                        (sy + oy) as i32,
+                        (tile_size / 2.0).ceil() as i32,
+                        (tile_size / 2.0).ceil() as i32,
+                        cr, cg, cb
+                    );
+                }
+            } else {
+                let base_color = match prog.kind {
+                    0 => (0, 0, 150),      // Town Center
+                    2 => (80, 160, 80),    // Farm
+                    3 => (220, 200, 140),  // House
+                    4 => (160, 160, 180),  // Tower
+                    5 => (180, 80, 80),    // Barracks
+                    _ => (120, 120, 120),
+                };
+                let factor = (0.3 + prog.progress.clamp(0.0, 1.0) * 0.7).min(1.0);
+                let cr = (base_color.0 as f32 * factor) as u8;
+                let cg = (base_color.1 as f32 * factor) as u8;
+                let cb = (base_color.2 as f32 * factor) as u8;
+                buffer.rect(sx as i32, sy as i32, tile_size.ceil() as i32, tile_size.ceil() as i32, cr, cg, cb);
+                buffer.rect_outline(sx as i32, sy as i32, tile_size.ceil() as i32, tile_size.ceil() as i32, 20, 20, 20);
+            }
 
             let tile_world_x = *tx as f32 * TILE_SIZE_BASE;
             let tile_world_y = *ty as f32 * TILE_SIZE_BASE;
@@ -2858,34 +2984,7 @@ pub fn run_game() -> Result<(), JsValue> {
             buffer.line(sx1 as i32, sy1 as i32, sx2 as i32, sy2 as i32, 255, 200, 50, false);
         }
 
-        // Training Queue UI near spawn location (progress + ghost worker)
-        if let Some(my_id) = gs.my_id {
-            if let Some(tc) = gs.buildings.iter().find(|b| b.owner_id == my_id && b.kind == 0) {
-                if let Some(time_left) = gs.training_queue.first() {
-                    let total = 4.0_f32;
-                    let pct = (1.0 - (*time_left / total)).clamp(0.0, 1.0);
-                    // Approximate spawn spot: below TC, centered
-                    let spawn_px = tc.tile_x as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE * 0.5;
-                    let spawn_py = tc.tile_y as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE * 2.0;
-                    let sx = (spawn_px - cam_x) * zoom + screen_center_x;
-                    let sy = (spawn_py - cam_y) * zoom + screen_center_y;
-
-                    let bar_w = tile_size;
-                    let bar_h = 5.0;
-                    let bar_y = sy - bar_h - 6.0;
-                    buffer.rect(sx as i32, bar_y as i32, bar_w as i32, bar_h as i32, 20, 20, 20);
-                    buffer.rect(sx as i32, bar_y as i32, (bar_w * pct) as i32, bar_h as i32, 0, 180, 0);
-
-                    // Ghost worker silhouette that brightens as pct rises
-                    let ghost_size = (TILE_SIZE_BASE * 0.8 * zoom).max(8.0);
-                    let gx = sx - ghost_size / 2.0;
-                    let gy = sy - ghost_size / 2.0;
-                    let alpha = (0.2 + pct * 0.8).clamp(0.2, 1.0);
-                    let wb = (200.0 * alpha) as u8; // blue-ish ghost
-                    buffer.rect(gx as i32, gy as i32, ghost_size as i32, ghost_size as i32, 0, 0, wb);
-                }
-            }
-        }
+        // Training queue visuals removed (instant spawn)
 
         // Render Units
         for u in &gs.units {
@@ -3048,6 +3147,25 @@ pub fn run_game() -> Result<(), JsValue> {
                  // Plus icon
                  buffer.rect(18, (home_btn_y + 17.0) as i32, 24, 6, col_ui_green.0, col_ui_green.1, col_ui_green.2);
                  buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, col_ui_green.0, col_ui_green.1, col_ui_green.2);
+
+                 // TC menu (vertical) when open
+                 if gs.tc_menu_open {
+                     let menu_gap = 10.0;
+                     let top_pad = 0.0; // reduce extra top padding
+                     let side_pad = 10.0;
+                     let menu_height = btn_size;
+                     let opt_y = home_btn_y - (btn_size + menu_gap);
+                     let panel_w = btn_size + side_pad * 2.0;
+                     let panel_x = 10.0 - side_pad;
+                     let panel_y = opt_y - top_pad;
+                     let panel_h = menu_height + top_pad; // no bottom pad to avoid covering toggle
+                     buffer.rect(panel_x as i32, panel_y as i32, panel_w as i32, panel_h as i32, 40, 40, 40);
+
+                     // Single worker spawn button (blue square with white plus)
+                     buffer.rect(10, opt_y as i32, btn_size as i32, btn_size as i32, 0, 0, 150);
+                     buffer.rect(18, (opt_y + 17.0) as i32, 24, 6, 255, 255, 255);
+                     buffer.rect(27, (opt_y + 8.0) as i32, 6, 24, 255, 255, 255);
+                 }
              } else if b.kind == BuildKind::Barracks.to_kind_id() {
                  // Train Warrior Button
                  buffer.rect(10, home_btn_y as i32, btn_size as i32, btn_size as i32, 120, 40, 40);
@@ -3067,13 +3185,20 @@ pub fn run_game() -> Result<(), JsValue> {
                  buffer.rect(27, (home_btn_y + 8.0) as i32, 6, 24, col_ui_green.0, col_ui_green.1, col_ui_green.2);
 
                 if gs.build_menu_open {
-                     let options = [
-                         (BuildKind::Wall, (150u8, 150u8, 150u8)),
-                         (BuildKind::Farm, (50u8, 120u8, 50u8)),
-                         (BuildKind::House, (200u8, 180u8, 120u8)),
-                         (BuildKind::Tower, (120u8, 120u8, 140u8)),
-                         (BuildKind::Barracks, (180u8, 80u8, 80u8)),
-                     ];
+                    let wall_blue_1 = col_player_wall_1;
+                    let wall_blue_2 = col_player_wall_2;
+                    let wall_blue = (
+                        ((wall_blue_1.0 as i32 + wall_blue_2.0 as i32) / 2) as u8,
+                        ((wall_blue_1.1 as i32 + wall_blue_2.1 as i32) / 2) as u8,
+                        ((wall_blue_1.2 as i32 + wall_blue_2.2 as i32) / 2) as u8,
+                    );
+                    let options = [
+                        (BuildKind::Wall, wall_blue),
+                        (BuildKind::Farm, (50u8, 120u8, 50u8)),
+                        (BuildKind::House, (200u8, 180u8, 120u8)),
+                        (BuildKind::Tower, (120u8, 120u8, 140u8)),
+                        (BuildKind::Barracks, (180u8, 80u8, 80u8)),
+                    ];
                         let menu_gap = 10.0; // uniform spacing with other vertical menus
                     // Background panel matching footer color, sized to fit options with top padding; bottom aligns to the build button
                     let menu_height = options.len() as f32 * (btn_size + menu_gap) - menu_gap;
