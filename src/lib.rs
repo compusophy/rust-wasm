@@ -68,6 +68,7 @@ enum GameMessage {
     BuildProgress { tile_x: i32, tile_y: i32, kind: u8, progress: f32 },
     BuildingSpawned { building: BuildingDTO },
     AssignGather { unit_ids: Vec<usize>, target_x: i32, target_y: i32, kind: u8 },
+    DepositNow { unit_ids: Vec<usize> },
     TowerShot { x1: f32, y1: f32, x2: f32, y2: f32 },
     UnitDied { owner_id: i32, unit_idx: usize },
     BuildingDestroyed { tile_x: i32, tile_y: i32 },
@@ -1632,6 +1633,7 @@ impl GameState {
                        if clicked_dropoff && any_unit_selected {
                            // Send selected units to this drop-off; do not toggle selection
                            let mut move_commands = Vec::new();
+                           let mut deposit_units = Vec::new();
                            let mut selected_units = Vec::new();
                            for (i, unit) in self.units.iter().enumerate() {
                                if unit.selected && unit.owner_id == my_id {
@@ -1642,6 +1644,20 @@ impl GameState {
                            let target_tx = (tile_left / TILE_SIZE_BASE) as i32;
                            let target_ty = (tile_top / TILE_SIZE_BASE) as i32;
                            for (i, ux, uy) in selected_units {
+                               // player-local idx
+                               let mut my_idx = 0;
+                               for (k, u) in self.units.iter().enumerate() {
+                                   if u.owner_id == my_id {
+                                       if k == i { break; }
+                                       my_idx += 1;
+                                   }
+                               }
+                               if let Some(u) = self.units.get(i) {
+                                   if (u.carry_wood + u.carry_stone + u.carry_gold + u.carry_food) > 0.0 {
+                                       deposit_units.push(my_idx);
+                                   }
+                               }
+
                                if let Some((wx, wy)) = self.find_closest_walkable_cardinal(target_tx, target_ty, ux, uy)
                                    .or_else(|| self.find_closest_walkable(target_tx, target_ty, ux, uy))
                                    .or_else(|| self.find_adjacent_walkable(target_tx, target_ty)) {
@@ -1651,19 +1667,17 @@ impl GameState {
                                            u.path = path;
                                            u.job = UnitJob::Returning;
                                        }
-                                       // player-local idx
-                                       let mut my_idx = 0;
-                                       for (k, u) in self.units.iter().enumerate() {
-                                           if u.owner_id == my_id {
-                                               if k == i { break; }
-                                               my_idx += 1;
-                                           }
-                                       }
                                        move_commands.push((my_idx, wx, wy));
                                    }
                                }
                            }
                            if let Some(ws) = &self.socket {
+                               if !deposit_units.is_empty() {
+                                   let msg = GameMessage::DepositNow { unit_ids: deposit_units.clone() };
+                                   if let Ok(json) = serde_json::to_string(&msg) {
+                                       let _ = ws.send_with_str(&json);
+                                   }
+                               }
                                for (idx_local, wx, wy) in move_commands {
                                    let msg = GameMessage::UnitMove { player_id: my_id, unit_idx: idx_local, x: wx, y: wy };
                                    if let Ok(json) = serde_json::to_string(&msg) {
@@ -2348,6 +2362,7 @@ pub fn run_game() -> Result<(), JsValue> {
                     let mut state = gs.borrow_mut();
                     match msg {
                         GameMessage::Join { .. } => {}, 
+                        GameMessage::DepositNow { .. } => {}, 
                         GameMessage::Error { message } => {
                             log(&format!("Server Error: {}", message));
                             
@@ -2454,12 +2469,34 @@ pub fn run_game() -> Result<(), JsValue> {
                                         }
                                     } else if emptied_return {
                                         if let Some((tx, ty, k)) = state.gather_targets.get(&(owner_id, my_local_idx)).cloned() {
+                                            // Plot a path back to the resource before reassigning gather
+                                            let mut move_target: Option<(f32, f32)> = None;
+                                            if let Some(adj) = state.find_closest_walkable_cardinal(tx, ty, ux, uy)
+                                                .or_else(|| state.find_closest_walkable(tx, ty, ux, uy))
+                                                .or_else(|| state.find_adjacent_walkable(tx, ty)) {
+                                                let path_back = state.find_path((ux, uy), adj);
+                                                move_target = path_back.last().copied().or(Some(adj));
+                                                if let Some(u) = state.units.get_mut(idx) {
+                                                    u.job = UnitJob::Gathering;
+                                                    if !path_back.is_empty() {
+                                                        u.path = path_back.clone();
+                                                    } else {
+                                                        u.path.clear();
+                                                    }
+                                                }
+                                            } else if let Some(u) = state.units.get_mut(idx) {
+                                                // If no path could be found, still mark as gathering
+                                                u.job = UnitJob::Gathering;
+                                            }
+
                                             if let Some(ws) = &state.socket {
                                                 let msg = GameMessage::AssignGather { unit_ids: vec![my_local_idx], target_x: tx, target_y: ty, kind: k };
                                                 if let Ok(json) = serde_json::to_string(&msg) { let _ = ws.send_with_str(&json); }
-                                            }
-                                            if let Some(u) = state.units.get_mut(idx) {
-                                                u.job = UnitJob::Gathering;
+
+                                                if let Some((mx, my)) = move_target {
+                                                    let move_msg = GameMessage::UnitMove { player_id: owner_id, unit_idx: my_local_idx, x: mx, y: my };
+                                                    if let Ok(json) = serde_json::to_string(&move_msg) { let _ = ws.send_with_str(&json); }
+                                                }
                                             }
                                         }
                                     }
@@ -3438,11 +3475,14 @@ pub fn run_game() -> Result<(), JsValue> {
         let res = gs.resources;
         let bar_x = 30;
         let bar_y = 6;
-        let max_width = 120.0;
-        let wood_w = (res.wood / 2.0).min(max_width) as i32;
-        let stone_w = (res.stone / 2.0).min(max_width) as i32;
-        let gold_w = (res.gold / 2.0).min(max_width) as i32;
-        let food_w = (res.food / 2.0).min(max_width) as i32;
+        // Scale bars relative to the highest current resource so they don't visually cap
+        let max_width = (WIDTH as f32 - 60.0).max(160.0);
+        let res_max = res.wood.max(res.stone).max(res.gold).max(res.food).max(1.0);
+        let scale = (max_width / res_max).min(1.0);
+        let wood_w = (res.wood * scale) as i32;
+        let stone_w = (res.stone * scale) as i32;
+        let gold_w = (res.gold * scale) as i32;
+        let food_w = (res.food * scale) as i32;
         buffer.rect(bar_x, bar_y, wood_w, 4, 139, 69, 19);
         buffer.rect(bar_x, bar_y + 6, stone_w, 4, 120, 120, 120);
         buffer.rect(bar_x, bar_y + 12, gold_w, 4, 255, 215, 0);

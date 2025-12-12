@@ -73,6 +73,7 @@ enum GameMessage {
     BuildProgress { tile_x: i32, tile_y: i32, kind: u8, progress: f32 },
     BuildingSpawned { building: BuildingDTO },
     AssignGather { unit_ids: Vec<usize>, target_x: i32, target_y: i32, kind: u8 },
+    DepositNow { unit_ids: Vec<usize> },
     TowerShot { x1: f32, y1: f32, x2: f32, y2: f32 },
     UnitDied { owner_id: i32, unit_idx: usize },
     BuildingDestroyed { tile_x: i32, tile_y: i32 },
@@ -147,7 +148,7 @@ const WARRIOR_RANGE: f32 = 48.0;
 const WARRIOR_DPS: f32 = 30.0;
 const POP_FROM_HOUSE: i32 = 1;
 const TILE_SIZE: f32 = 16.0;
-const CARRY_CAP: f32 = 20.0;
+const CARRY_CAP: f32 = 80.0;
 const WOOD_NODE_AMOUNT: f32 = 120.0;
 const STONE_NODE_AMOUNT: f32 = 120.0;
 const GOLD_NODE_AMOUNT: f32 = 120.0;
@@ -217,6 +218,7 @@ struct GatherTask {
     kind: u8,
     target_x: i32,
     target_y: i32,
+    force_deposit: bool,
 }
 
 struct GlobalState {
@@ -550,64 +552,63 @@ async fn main() {
                             (u.x, u.y, gtask.kind, u.carry_wood, u.carry_stone, u.carry_gold, u.carry_food)
                         };
 
-                        // Early deposit if at dropoff (allows manual turn-in even if not full)
-                        let total_carry = c_wood + c_stone + c_gold + c_food;
-                        let at_drop = dropoff_near(&gs, owner, ux, uy, gtask.kind);
-                        if total_carry > 0.0 && at_drop {
-                            let (dw, ds, dg, df) = {
-                                if let Some(units) = gs.units.get_mut(&owner) {
-                                    if uid < units.len() {
-                                        let u = &mut units[uid];
-                                        let dw = u.carry_wood;
-                                        let ds = u.carry_stone;
-                                        let dg = u.carry_gold;
-                                        let df = u.carry_food;
-                                        u.carry_wood = 0.0;
-                                        u.carry_stone = 0.0;
-                                        u.carry_gold = 0.0;
-                                        u.carry_food = 0.0;
-                                        (dw, ds, dg, df)
-                                    } else { (0.0, 0.0, 0.0, 0.0) }
-                                } else { (0.0, 0.0, 0.0, 0.0) }
-                            };
-
-                            // If nothing drained, skip
-                            if (dw + ds + dg + df) == 0.0 {
-                                continue;
-                            }
-
-                            let (res_snapshot, pop_cap, pop_used) = {
-                                let entry = gs.resources.entry(owner).or_insert(default_resources());
-                                entry.wood += dw;
-                                entry.stone += ds;
-                                entry.gold += dg;
-                                entry.food += df;
-                                let res_snapshot = *entry;
-                                let pop_cap = *gs.pop_cap.get(&owner).unwrap_or(&default_pop_cap());
-                                let pop_used = gs.units.get(&owner).map(|u2| u2.len() as i32).unwrap_or(0);
-                                (res_snapshot, pop_cap, pop_used)
-                            };
-
-                            // broadcast carry update
-                            let _ = tx_clone.send(serde_json::to_string(&GameMessage::UnitCarry {
-                                owner_id: owner,
-                                unit_idx: uid,
-                                carry_wood: 0.0,
-                                carry_stone: 0.0,
-                                carry_gold: 0.0,
-                                carry_food: 0.0,
-                            }).unwrap_or_default());
-                            // broadcast resources snapshot
-                            resource_updates.push((owner, res_snapshot, pop_cap, pop_used));
-                            continue;
-                        }
-
-                        // Must be near the target to gather (lenient radius)
+                        // Distance to target for gather range
                         let tx = gtask.target_x as f32 * TILE_SIZE + TILE_SIZE / 2.0;
                         let ty = gtask.target_y as f32 * TILE_SIZE + TILE_SIZE / 2.0;
                         let dx = ux - tx;
                         let dy = uy - ty;
-                        if (dx * dx + dy * dy) > (TILE_SIZE * 2.5).powi(2) {
+                        let in_gather_range = (dx * dx + dy * dy) <= (TILE_SIZE * 2.5).powi(2);
+
+                        let total_carry_now = c_wood + c_stone + c_gold + c_food;
+                        let force_deposit = gtask.force_deposit;
+                        // Partial deposit if at dropoff; allow manual deposit even when still in gather range
+                        let at_drop = dropoff_near(&gs, owner, ux, uy, gtask.kind);
+                        if at_drop && total_carry_now > 0.0 && (force_deposit || !in_gather_range) {
+                            if let Some(units) = gs.units.get_mut(&owner) {
+                                if uid < units.len() {
+                                    let u = &mut units[uid];
+                                    let dw = u.carry_wood;
+                                    let ds = u.carry_stone;
+                                    let dg = u.carry_gold;
+                                    let df = u.carry_food;
+                                    if (dw + ds + dg + df) > 0.0 {
+                                        u.carry_wood = 0.0;
+                                        u.carry_stone = 0.0;
+                                        u.carry_gold = 0.0;
+                                        u.carry_food = 0.0;
+                                        let entry = gs.resources.entry(owner).or_insert(default_resources());
+                                        entry.wood += dw;
+                                        entry.stone += ds;
+                                        entry.gold += dg;
+                                        entry.food += df;
+                                        let res_snapshot = *entry;
+                                        let pop_cap = *gs.pop_cap.get(&owner).unwrap_or(&default_pop_cap());
+                                        let pop_used = gs.units.get(&owner).map(|u2| u2.len() as i32).unwrap_or(0);
+                                        let _ = tx_clone.send(serde_json::to_string(&GameMessage::UnitCarry {
+                                            owner_id: owner,
+                                            unit_idx: uid,
+                                            carry_wood: 0.0,
+                                            carry_stone: 0.0,
+                                            carry_gold: 0.0,
+                                            carry_food: 0.0,
+                                        }).unwrap_or_default());
+                                        resource_updates.push((owner, res_snapshot, pop_cap, pop_used));
+                                        if force_deposit {
+                                            if let Some(task) = gs.gather_tasks.get_mut(&(owner, uid)) {
+                                                task.force_deposit = false;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        // No early deposit beyond the above; main deposit happens when full/node-empty and near dropoff
+                        let total_carry = c_wood + c_stone + c_gold + c_food;
+
+                        // Must be near the target to gather (lenient radius)
+                        if !in_gather_range {
                             continue;
                         }
 
@@ -1424,7 +1425,16 @@ async fn handle_connection(
                         GameMessage::AssignGather { unit_ids, target_x, target_y, kind } => {
                             if let Ok(mut gs) = recv_state.try_lock() {
                                 for uid in unit_ids {
-                                    gs.gather_tasks.insert((player_id, uid), GatherTask { kind, target_x, target_y });
+                                    gs.gather_tasks.insert((player_id, uid), GatherTask { kind, target_x, target_y, force_deposit: false });
+                                }
+                            }
+                        },
+                        GameMessage::DepositNow { unit_ids } => {
+                            if let Ok(mut gs) = recv_state.try_lock() {
+                                for uid in unit_ids {
+                                    if let Some(task) = gs.gather_tasks.get_mut(&(player_id, uid)) {
+                                        task.force_deposit = true;
+                                    }
                                 }
                             }
                         },
