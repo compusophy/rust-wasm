@@ -33,6 +33,14 @@ struct UnitDTO {
     y: f32,
     kind: u8,
     hp: f32,
+    #[serde(default)]
+    carry_wood: f32,
+    #[serde(default)]
+    carry_stone: f32,
+    #[serde(default)]
+    carry_gold: f32,
+    #[serde(default)]
+    carry_food: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -68,6 +76,7 @@ enum GameMessage {
     ResourceUpdate { player_id: i32, resources: Resources, pop_cap: i32, pop_used: i32 },
     DeleteUnit { unit_idx: usize },
     DeleteBuilding { tile_x: i32, tile_y: i32 },
+    UnitCarry { owner_id: i32, unit_idx: usize, carry_wood: f32, carry_stone: f32, carry_gold: f32, carry_food: f32 },
     Error { message: String },
 }
 
@@ -125,6 +134,9 @@ const COST_FARM: Resources = Resources { wood: 30.0, stone: 0.0, gold: 0.0, food
 const COST_HOUSE: Resources = Resources { wood: 25.0, stone: 0.0, gold: 0.0, food: 0.0 };
 const COST_TOWER: Resources = Resources { wood: 0.0, stone: 40.0, gold: 0.0, food: 0.0 };
 const COST_BARRACKS: Resources = Resources { wood: 60.0, stone: 0.0, gold: 0.0, food: 0.0 };
+const COST_LUMBER_MILL: Resources = Resources { wood: 30.0, stone: 10.0, gold: 0.0, food: 0.0 };
+const COST_MINING_CAMP: Resources = Resources { wood: 30.0, stone: 10.0, gold: 0.0, food: 0.0 };
+const COST_WHEAT_MILL: Resources = Resources { wood: 30.0, stone: 10.0, gold: 0.0, food: 0.0 };
 const COST_WORKER: Resources = Resources { wood: 0.0, stone: 0.0, gold: 0.0, food: 50.0 };
 const COST_WARRIOR: Resources = Resources { wood: 0.0, stone: 0.0, gold: 20.0, food: 40.0 };
 const WORKER_HP: f32 = 50.0;
@@ -135,6 +147,10 @@ const TOWER_HP: f32 = 300.0;
 const FARM_HP: f32 = 220.0;
 const HOUSE_HP: f32 = 220.0;
 const BARRACKS_HP: f32 = 260.0;
+const LUMBER_HP: f32 = 220.0;
+const MINING_HP: f32 = 220.0;
+const WHEAT_HP: f32 = 220.0;
+const CARRY_CAP: f32 = 80.0;
 
 // --- BUILDING & UNIT KINDS ---
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -144,6 +160,9 @@ enum BuildKind {
     House,
     Tower,
     Barracks,
+    LumberMill,
+    MiningCamp,
+    WheatMill,
 }
 
 impl BuildKind {
@@ -154,6 +173,9 @@ impl BuildKind {
             BuildKind::House => 3,
             BuildKind::Tower => 4,
             BuildKind::Barracks => 5,
+            BuildKind::LumberMill => 6,
+            BuildKind::MiningCamp => 7,
+            BuildKind::WheatMill => 8,
         }
     }
 
@@ -164,6 +186,9 @@ impl BuildKind {
             BuildKind::House => COST_HOUSE,
             BuildKind::Tower => COST_TOWER,
             BuildKind::Barracks => COST_BARRACKS,
+            BuildKind::LumberMill => COST_LUMBER_MILL,
+            BuildKind::MiningCamp => COST_MINING_CAMP,
+            BuildKind::WheatMill => COST_WHEAT_MILL,
         }
     }
 }
@@ -214,9 +239,11 @@ enum GatherKind {
 }
 
 #[derive(Clone, Copy)]
+#[derive(PartialEq)]
 enum UnitJob {
     Idle,
     Gathering,
+    Returning,
 }
 
 struct PixelBuffer {
@@ -341,6 +368,10 @@ struct Unit {
     owner_id: i32, // Synced Owner ID
     job: UnitJob,
     hp: f32,
+    carry_wood: f32,
+    carry_stone: f32,
+    carry_gold: f32,
+    carry_food: f32,
 }
 
 struct Building {
@@ -426,6 +457,9 @@ struct GameState {
 
     // Town Center menu
     tc_menu_open: bool,
+
+    // Remember last gather target per unit (owner_id, owner_local_idx) -> (tile_x, tile_y, kind)
+    gather_targets: HashMap<(i32, usize), (i32, i32, u8)>,
 }
 
 impl GameState {
@@ -473,6 +507,7 @@ impl GameState {
             pending_single_build: None,
             training_queue: Vec::new(),
             tc_menu_open: false,
+            gather_targets: HashMap::new(),
         };
 
         // Generate Initial Chunk (0,0)
@@ -495,8 +530,8 @@ impl GameState {
         
         let color = if Some(pid) == self.my_id { (0, 0, 255) } else { (255, 0, 0) };
         
-        self.units.push(Unit { x: sx + 30.0, y: sy + 30.0, path: Vec::new(), selected: false, kind: UnitKind::Worker.to_u8(), color, owner_id: pid, job: UnitJob::Idle, hp: WORKER_HP });
-        self.units.push(Unit { x: sx - 20.0, y: sy + 40.0, path: Vec::new(), selected: false, kind: UnitKind::Worker.to_u8(), color, owner_id: pid, job: UnitJob::Idle, hp: WORKER_HP });
+        self.units.push(Unit { x: sx + 30.0, y: sy + 30.0, path: Vec::new(), selected: false, kind: UnitKind::Worker.to_u8(), color, owner_id: pid, job: UnitJob::Idle, hp: WORKER_HP, carry_wood: 0.0, carry_stone: 0.0, carry_gold: 0.0, carry_food: 0.0 });
+        self.units.push(Unit { x: sx - 20.0, y: sy + 40.0, path: Vec::new(), selected: false, kind: UnitKind::Worker.to_u8(), color, owner_id: pid, job: UnitJob::Idle, hp: WORKER_HP, carry_wood: 0.0, carry_stone: 0.0, carry_gold: 0.0, carry_food: 0.0 });
         if Some(pid) == self.my_id {
             self.pop_used += 2;
         }
@@ -1004,9 +1039,12 @@ impl GameState {
                 BuildKind::House,
                 BuildKind::Tower,
                 BuildKind::Barracks,
+                BuildKind::LumberMill,
+                BuildKind::MiningCamp,
+                BuildKind::WheatMill,
             ];
             for (idx, kind) in options.iter().enumerate() {
-                let opt_y = build_btn_y - ((idx as f32 + 1.0) * (btn_size + 6.0));
+                let opt_y = build_btn_y - ((idx as f32 + 1.0) * (btn_size + 10.0));
                     let affordable = self.resources.has(&kind.cost());
                     if screen_x >= build_btn_x && screen_x <= build_btn_x + btn_size &&
                        screen_y >= opt_y && screen_y <= opt_y + btn_size {
@@ -1564,6 +1602,7 @@ impl GameState {
                 let mut deselect_tc = false;
                 let mut select_tc = false;
                 let mut toggle_other = false;
+                let mut clicked_dropoff = false;
                 let (tile_left, tile_top, tile_right, tile_bottom, kind);
                 {
                     let b = &self.buildings[idx];
@@ -1587,31 +1626,79 @@ impl GameState {
                            ));
                            break;
                        }
-                       // Selection rules:
-                       if kind == 0 {
-                           // Town Center is exclusive: clear all other selections and select only TC
-                           deselect_tc = true; // reuse to clear others
-                           select_tc = true;
-                       } else {
-                           // If TC was selected alone, drop it when selecting another entity
-                           if tc_selected {
-                               deselect_tc = true;
+                       if any_unit_selected && (kind == 0 || kind == BuildKind::LumberMill.to_kind_id() || kind == BuildKind::MiningCamp.to_kind_id() || kind == BuildKind::WheatMill.to_kind_id()) {
+                           clicked_dropoff = true;
+                       }
+                       if clicked_dropoff && any_unit_selected {
+                           // Send selected units to this drop-off; do not toggle selection
+                           let mut move_commands = Vec::new();
+                           let mut selected_units = Vec::new();
+                           for (i, unit) in self.units.iter().enumerate() {
+                               if unit.selected && unit.owner_id == my_id {
+                                   selected_units.push((i, unit.x, unit.y));
+                               }
                            }
-                           toggle_other = true;
+                           // Use the clicked building position for adjacency targeting
+                           let target_tx = (tile_left / TILE_SIZE_BASE) as i32;
+                           let target_ty = (tile_top / TILE_SIZE_BASE) as i32;
+                           for (i, ux, uy) in selected_units {
+                               if let Some((wx, wy)) = self.find_closest_walkable_cardinal(target_tx, target_ty, ux, uy)
+                                   .or_else(|| self.find_closest_walkable(target_tx, target_ty, ux, uy))
+                                   .or_else(|| self.find_adjacent_walkable(target_tx, target_ty)) {
+                                   let path = self.find_path((ux, uy), (wx, wy));
+                                   if !path.is_empty() {
+                                       if let Some(u) = self.units.get_mut(i) {
+                                           u.path = path;
+                                           u.job = UnitJob::Returning;
+                                       }
+                                       // player-local idx
+                                       let mut my_idx = 0;
+                                       for (k, u) in self.units.iter().enumerate() {
+                                           if u.owner_id == my_id {
+                                               if k == i { break; }
+                                               my_idx += 1;
+                                           }
+                                       }
+                                       move_commands.push((my_idx, wx, wy));
+                                   }
+                               }
+                           }
+                           if let Some(ws) = &self.socket {
+                               for (idx_local, wx, wy) in move_commands {
+                                   let msg = GameMessage::UnitMove { player_id: my_id, unit_idx: idx_local, x: wx, y: wy };
+                                   if let Ok(json) = serde_json::to_string(&msg) {
+                                       let _ = ws.send_with_str(&json);
+                                   }
+                               }
+                           }
+                           return;
+                       } else {
+                           // Selection rules:
+                           if kind == 0 {
+                               // Town Center is exclusive: clear all other selections and select only TC
+                               deselect_tc = true; // reuse to clear others
+                               select_tc = true;
+                           } else {
+                               // If TC was selected alone, drop it when selecting another entity
+                               if tc_selected {
+                                   deselect_tc = true;
+                               }
+                               toggle_other = true;
+                           }
+                           // Apply selection mutations now that borrows are released
+                           if deselect_tc {
+                               for u in &mut self.units { u.selected = false; }
+                               for other_b in &mut self.buildings { other_b.selected = false; }
+                           }
+                           if select_tc {
+                               if let Some(bmut) = self.buildings.get_mut(idx) { bmut.selected = true; }
+                           }
+                           if toggle_other {
+                               if let Some(bmut) = self.buildings.get_mut(idx) { bmut.selected = !bmut.selected; }
+                           }
+                           clicked_building = true;
+                           break;
                        }
-                       // Apply selection mutations now that borrows are released
-                       if deselect_tc {
-                           for u in &mut self.units { u.selected = false; }
-                           for other_b in &mut self.buildings { other_b.selected = false; }
-                       }
-                       if select_tc {
-                           if let Some(bmut) = self.buildings.get_mut(idx) { bmut.selected = true; }
-                       }
-                       if toggle_other {
-                           if let Some(bmut) = self.buildings.get_mut(idx) { bmut.selected = !bmut.selected; }
-                       }
-                       clicked_building = true;
-                       break;
                    }
             }
             
@@ -1675,6 +1762,14 @@ impl GameState {
                     for (i, path) in paths {
                         self.units[i].path = path;
                         self.units[i].job = UnitJob::Idle;
+                        let mut my_idx = 0;
+                        for (k, u) in self.units.iter().enumerate() {
+                            if u.owner_id == my_id {
+                                if k == i { break; }
+                                my_idx += 1;
+                            }
+                        }
+                        self.gather_targets.remove(&(my_id, my_idx));
                     }
                     
                     if let Some(ws) = &self.socket {
@@ -1950,28 +2045,102 @@ impl GameState {
     }
 
     fn find_adjacent_walkable(&self, tx: i32, ty: i32) -> Option<(f32, f32)> {
-        let dirs = [(1,0), (-1,0), (0,1), (0,-1)];
+        self.find_closest_walkable(tx, ty, tx as f32 * TILE_SIZE_BASE, ty as f32 * TILE_SIZE_BASE)
+    }
+
+    fn find_closest_walkable(&self, tx: i32, ty: i32, from_x: f32, from_y: f32) -> Option<(f32, f32)> {
+        let dirs = [
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (1, -1), (-1, 1), (-1, -1),
+        ];
+        let mut best: Option<(f32, f32, f32)> = None; // dist2, wx, wy
         for (dx, dy) in dirs {
             let nx = tx + dx;
             let ny = ty + dy;
             if self.is_tile_walkable(nx, ny) {
-                return Some((
-                    nx as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0,
-                    ny as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0,
-                ));
+                let wx = nx as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0;
+                let wy = ny as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0;
+                let dxw = wx - from_x;
+                let dyw = wy - from_y;
+                let d2 = dxw * dxw + dyw * dyw;
+                if best.map_or(true, |(bd2, _, _)| d2 < bd2) {
+                    best = Some((d2, wx, wy));
+                }
             }
         }
-        None
+        best.map(|(_, wx, wy)| (wx, wy))
+    }
+
+    fn find_closest_walkable_cardinal(&self, tx: i32, ty: i32, from_x: f32, from_y: f32) -> Option<(f32, f32)> {
+        let dirs = [(1,0), (-1,0), (0,1), (0,-1)];
+        let mut best: Option<(f32, f32, f32)> = None;
+        for (dx, dy) in dirs {
+            let nx = tx + dx;
+            let ny = ty + dy;
+            if self.is_tile_walkable(nx, ny) {
+                let wx = nx as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0;
+                let wy = ny as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0;
+                let dxw = wx - from_x;
+                let dyw = wy - from_y;
+                let d2 = dxw*dxw + dyw*dyw;
+                if best.map_or(true, |(bd2, _, _)| d2 < bd2) {
+                    best = Some((d2, wx, wy));
+                }
+            }
+        }
+        best.map(|(_, wx, wy)| (wx, wy))
+    }
+
+    fn nearest_dropoff(&self, from_x: f32, from_y: f32, res_kind: u8) -> Option<(f32, f32)> {
+        let my_id = self.my_id?;
+        let allowed: &[u8] = match res_kind {
+            2 => &[0, BuildKind::LumberMill.to_kind_id()],
+            3 | 4 => &[0, BuildKind::MiningCamp.to_kind_id()],
+            5 => &[0, BuildKind::WheatMill.to_kind_id()],
+            _ => &[0],
+        };
+        let mut best: Option<(f32, f32, f32)> = None; // dist, wx, wy
+        for b in &self.buildings {
+            if b.owner_id != my_id { continue; }
+            if !allowed.contains(&b.kind) { continue; }
+            let wx = b.tile_x as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0;
+            let wy = b.tile_y as f32 * TILE_SIZE_BASE + TILE_SIZE_BASE / 2.0;
+            let dx = wx - from_x;
+            let dy = wy - from_y;
+            let dist = (dx*dx + dy*dy).sqrt();
+            if best.map_or(true, |(bd, _, _)| dist < bd) {
+                best = Some((dist, wx, wy));
+            }
+        }
+        best.and_then(|(_, wx, wy)| {
+            let tx = (wx / TILE_SIZE_BASE).floor() as i32;
+            let ty = (wy / TILE_SIZE_BASE).floor() as i32;
+            // Prefer cardinal adjacency for dropoff to avoid diagonal stand positions
+            self.find_closest_walkable_cardinal(tx, ty, from_x, from_y)
+                .or_else(|| self.find_closest_walkable(tx, ty, from_x, from_y))
+                .or(Some((wx, wy)))
+        })
     }
 
     fn assign_gather(&mut self, kind: GatherKind, target_tile: (i32, i32)) {
         let my_id = if let Some(id) = self.my_id { id } else { return };
-        if let Some(adj) = self.find_adjacent_walkable(target_tile.0, target_tile.1) {
-            let selected: Vec<(usize, f32, f32)> = self.units.iter().enumerate()
-                .filter(|(_, u)| u.owner_id == my_id && u.selected)
-                .map(|(i, u)| (i, u.x, u.y))
-                .collect();
 
+        let selected: Vec<(usize, f32, f32)> = self.units.iter().enumerate()
+            .filter(|(_, u)| u.owner_id == my_id && u.selected)
+            .map(|(i, u)| (i, u.x, u.y))
+            .collect();
+
+        if selected.is_empty() {
+            return;
+        }
+
+        // Pick adjacent based on first selected unit's position
+        let (_first_idx, fx, fy) = selected[0];
+        let adj = self.find_closest_walkable_cardinal(target_tile.0, target_tile.1, fx, fy)
+            .or_else(|| self.find_closest_walkable(target_tile.0, target_tile.1, fx, fy))
+            .or_else(|| self.find_adjacent_walkable(target_tile.0, target_tile.1));
+
+        if let Some(adj) = adj {
             let mut unit_ids = Vec::new();
             for (idx, x, y) in selected {
                 let path = self.find_path((x, y), adj);
@@ -1987,6 +2156,12 @@ impl GameState {
                     }
                 }
                 unit_ids.push(my_idx);
+                self.gather_targets.insert((my_id, my_idx), (target_tile.0, target_tile.1, match kind {
+                    GatherKind::Wood => 2,
+                    GatherKind::Stone => 3,
+                    GatherKind::Gold => 4,
+                    GatherKind::Farm => 5,
+                }));
             }
 
             if let Some(ws) = &self.socket {
@@ -1998,7 +2173,7 @@ impl GameState {
                         GatherKind::Wood => 2,
                         GatherKind::Stone => 3,
                         GatherKind::Gold => 4,
-                        GatherKind::Farm => 2,
+                        GatherKind::Farm => 5,
                     },
                 };
                 if let Ok(json) = serde_json::to_string(&msg) {
@@ -2202,6 +2377,95 @@ pub fn run_game() -> Result<(), JsValue> {
                                 web_sys::window().unwrap().alert_with_message(&message).unwrap();
                             }
                         },
+                        GameMessage::UnitCarry { owner_id, unit_idx, carry_wood, carry_stone, carry_gold, carry_food } => {
+                            if Some(owner_id) == state.my_id {
+                                // Locate unit index and my-local index without holding a mutable borrow
+                                let mut target_idx = None;
+                                let mut my_local_idx = 0;
+                                for (k, u) in state.units.iter().enumerate() {
+                                    if u.owner_id == owner_id {
+                                        if my_local_idx == unit_idx {
+                                            target_idx = Some(k);
+                                            break;
+                                        }
+                                        my_local_idx += 1;
+                                    }
+                                }
+
+                                if let Some(idx) = target_idx {
+                                    // Snapshot current data immutably
+                                    let (ux, uy, job_before) = {
+                                        let u = &state.units[idx];
+                                        (u.x, u.y, u.job)
+                                    };
+
+                                    let total = carry_wood + carry_stone + carry_gold + carry_food;
+                                    let needs_return = job_before == UnitJob::Gathering && total >= CARRY_CAP - 0.1 && total >= 1.0;
+                                    let emptied_return = job_before == UnitJob::Returning && total <= 0.01;
+
+                                    // Precompute return path (immutable borrow)
+                                    let mut return_path: Option<Vec<(f32, f32)>> = None;
+                                    if needs_return {
+                                        if let Some((tx, ty)) = state.nearest_dropoff(ux, uy, if carry_wood > 0.0 { 2 } else if carry_stone > 0.0 { 3 } else if carry_gold > 0.0 { 4 } else { 5 }) {
+                                            let dx = tx - ux;
+                                            let dy = ty - uy;
+                                            let dist2 = dx*dx + dy*dy;
+                                            let drop_rad2 = (TILE_SIZE_BASE * 2.5).powi(2);
+                                            // If already at dropoff, no need to path back
+                                            if dist2 > drop_rad2 {
+                                                let p = state.find_path((ux, uy), (tx, ty));
+                                                if !p.is_empty() {
+                                                    return_path = Some(p);
+                                                }
+                                            } else {
+                                                // Already at drop-off; don't trigger return path
+                                                return_path = Some(Vec::new());
+                                            }
+                                        }
+                                    }
+
+                                    // Apply carry updates mutably
+                                    {
+                                        if let Some(u) = state.units.get_mut(idx) {
+                                            u.carry_wood = carry_wood;
+                                            u.carry_stone = carry_stone;
+                                            u.carry_gold = carry_gold;
+                                            u.carry_food = carry_food;
+                                            if needs_return {
+                                                if let Some(ref p) = return_path {
+                                                    u.path = p.clone();
+                                                    u.job = UnitJob::Returning;
+                                                }
+                                            } else if emptied_return {
+                                                u.job = UnitJob::Idle; // may switch to Gathering below
+                                            }
+                                        }
+                                    }
+
+                                    // Send commands after mutable borrow
+                                    if needs_return {
+                                        if let Some(ref p) = return_path {
+                                            if let Some(ws) = &state.socket {
+                                                if let Some(last) = p.last() {
+                                                    let msg = GameMessage::UnitMove { player_id: owner_id, unit_idx: my_local_idx, x: last.0, y: last.1 };
+                                                    if let Ok(json) = serde_json::to_string(&msg) { let _ = ws.send_with_str(&json); }
+                                                }
+                                            }
+                                        }
+                                    } else if emptied_return {
+                                        if let Some((tx, ty, k)) = state.gather_targets.get(&(owner_id, my_local_idx)).cloned() {
+                                            if let Some(ws) = &state.socket {
+                                                let msg = GameMessage::AssignGather { unit_ids: vec![my_local_idx], target_x: tx, target_y: ty, kind: k };
+                                                if let Ok(json) = serde_json::to_string(&msg) { let _ = ws.send_with_str(&json); }
+                                            }
+                                            if let Some(u) = state.units.get_mut(idx) {
+                                                u.job = UnitJob::Gathering;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
                         GameMessage::Welcome { player_id, chunk_x, chunk_y, players, units, buildings, token, resources, pop_cap, pop_used } => {
                             state.my_id = Some(player_id);
                             state.my_chunk_x = chunk_x;
@@ -2267,11 +2531,15 @@ pub fn run_game() -> Result<(), JsValue> {
                                     y: u.y,
                                     path: Vec::new(), // Server doesn't sync path, units appear idle
                                     selected: false,
-                                kind: u.kind,
+                                    kind: u.kind,
                                     color,
                                     owner_id: u.owner_id,
                                     job: UnitJob::Idle,
                                     hp: u.hp,
+                                    carry_wood: u.carry_wood,
+                                    carry_stone: u.carry_stone,
+                                    carry_gold: u.carry_gold,
+                                    carry_food: u.carry_food,
                                 });
                                 if Some(u.owner_id) == state.my_id {
                                     state.pop_used += 1;
@@ -2387,6 +2655,10 @@ pub fn run_game() -> Result<(), JsValue> {
                                 owner_id: unit.owner_id,
                                 job: UnitJob::Idle,
                                 hp: unit.hp,
+                                carry_wood: unit.carry_wood,
+                                carry_stone: unit.carry_stone,
+                                carry_gold: unit.carry_gold,
+                                carry_food: unit.carry_food,
                             });
                             if Some(unit.owner_id) == state.my_id {
                                 state.pop_used += 1;
@@ -2852,6 +3124,22 @@ pub fn run_game() -> Result<(), JsValue> {
                 buffer.rect(sx as i32, sy as i32, size as i32, size as i32, 160, 80, 80);
                 buffer.rect((sx + size * 0.1) as i32, (sy + size * 0.6) as i32, (size * 0.8) as i32, (size * 0.25) as i32, 120, 60, 60);
                 buffer.rect((sx + size * 0.35) as i32, (sy + size * 0.3) as i32, (size * 0.3) as i32, (size * 0.25) as i32, 200, 200, 200);
+            } else if b.kind == BuildKind::LumberMill.to_kind_id() {
+                let size = tile_size;
+                buffer.rect(sx as i32, sy as i32, size as i32, size as i32, 90, 60, 30);
+                buffer.rect((sx + size * 0.1) as i32, (sy + size * 0.1) as i32, (size * 0.8) as i32, (size * 0.3) as i32, 120, 80, 40);
+                buffer.rect((sx + size * 0.2) as i32, (sy + size * 0.55) as i32, (size * 0.6) as i32, (size * 0.3) as i32, 60, 120, 60);
+            } else if b.kind == BuildKind::MiningCamp.to_kind_id() {
+                let size = tile_size;
+                buffer.rect(sx as i32, sy as i32, size as i32, size as i32, 110, 110, 130);
+                buffer.rect((sx + size * 0.2) as i32, (sy + size * 0.2) as i32, (size * 0.6) as i32, (size * 0.2) as i32, 80, 80, 100);
+                buffer.rect((sx + size * 0.15) as i32, (sy + size * 0.55) as i32, (size * 0.7) as i32, (size * 0.3) as i32, 70, 60, 50);
+            } else if b.kind == BuildKind::WheatMill.to_kind_id() {
+                let size = tile_size;
+                buffer.rect(sx as i32, sy as i32, size as i32, size as i32, 200, 180, 120);
+                buffer.rect((sx + size * 0.15) as i32, (sy + size * 0.15) as i32, (size * 0.7) as i32, (size * 0.2) as i32, 160, 120, 80);
+                // small vane
+                buffer.rect((sx + size * 0.45) as i32, (sy - size * 0.1) as i32, (size * 0.1) as i32, (size * 0.2) as i32, 230, 200, 150);
             }
 
             // Health bar for buildings
@@ -2863,6 +3151,9 @@ pub fn run_game() -> Result<(), JsValue> {
                 3 => HOUSE_HP,
                 4 => TOWER_HP,
                 5 => BARRACKS_HP,
+                6 => LUMBER_HP,
+                7 => MINING_HP,
+                8 => WHEAT_HP,
                 _ => 200.0,
             };
             
@@ -3019,9 +3310,66 @@ pub fn run_game() -> Result<(), JsValue> {
             
             // Only render unit sprite if on screen
             if sx > -50.0 && sx < WIDTH as f32 + 50.0 && sy > -50.0 && sy < HEIGHT as f32 + 50.0 {
+                let now_ms = web_sys::window().unwrap().performance().unwrap().now();
+                let bob = if u.job == UnitJob::Gathering {
+                    ((now_ms / 200.0).sin() as f32) * 1.2
+                } else { 0.0 };
+
                 let w = tile_size * 0.6;
                 let unit_draw_x = sx - w/2.0;
-                let unit_draw_y = sy - w/2.0;
+                let unit_draw_y = sy - w/2.0 + bob;
+
+                // If this unit is selected and has a gather target, draw a dashed box on the target tile
+                if u.selected {
+                    // find my local idx
+                    let mut my_idx = 0;
+                    for (k, uu) in gs.units.iter().enumerate() {
+                        if uu.owner_id == u.owner_id {
+                            if std::ptr::eq(uu, u) { break; }
+                            my_idx += 1;
+                        }
+                    }
+                    if let Some((tx, ty, _k)) = gs.gather_targets.get(&(u.owner_id, my_idx)) {
+                        let twx = *tx as f32 * TILE_SIZE_BASE;
+                        let twy = *ty as f32 * TILE_SIZE_BASE;
+                        let tsx = (twx - cam_x) * zoom + screen_center_x;
+                        let tsy = (twy - cam_y) * zoom + screen_center_y;
+                        let ts = tile_size;
+                        // dashed outline
+                        let step: f32 = 4.0;
+                        let len = ts;
+                        let x0 = tsx;
+                        let y0 = tsy;
+                        // top
+                        let mut s = 0.0;
+                        while s < len {
+                            let l = (step).min(len - s);
+                            buffer.rect((x0 + s) as i32, y0 as i32, l as i32, 1, 255, 255, 255);
+                            s += step * 2.0;
+                        }
+                        // bottom
+                        s = 0.0;
+                        while s < len {
+                            let l = (step).min(len - s);
+                            buffer.rect((x0 + s) as i32, (y0 + ts - 1.0) as i32, l as i32, 1, 255, 255, 255);
+                            s += step * 2.0;
+                        }
+                        // left
+                        s = 0.0;
+                        while s < len {
+                            let l = (step).min(len - s);
+                            buffer.rect(x0 as i32, (y0 + s) as i32, 1, l as i32, 255, 255, 255);
+                            s += step * 2.0;
+                        }
+                        // right
+                        s = 0.0;
+                        while s < len {
+                            let l = (step).min(len - s);
+                            buffer.rect((x0 + ts - 1.0) as i32, (y0 + s) as i32, 1, l as i32, 255, 255, 255);
+                            s += step * 2.0;
+                        }
+                    }
+                }
 
                 if u.selected {
                     let box_size = tile_size * 1.2;
@@ -3034,13 +3382,42 @@ pub fn run_game() -> Result<(), JsValue> {
                 }
                 buffer.rect(unit_draw_x as i32, unit_draw_y as i32, w as i32, w as i32, draw_color.0, draw_color.1, draw_color.2);
 
+                // Carry bars per resource (stacked above HP) only if selected
+                if u.selected || (Some(u.owner_id) != gs.my_id && u.selected) {
+                    let mut bar_y = unit_draw_y - 10.0;
+                    let bar_w = w;
+                    let cap = CARRY_CAP.max(1.0);
+                    let mut draw_carry_bar = |amount: f32, r: u8, g: u8, b: u8, buffer: &mut PixelBuffer, x: f32, y: f32, w: f32| {
+                        if amount > 0.0 {
+                            let ratio = (amount / cap).clamp(0.0, 1.0);
+                            let filled = (w * ratio) as i32;
+                            buffer.rect(x as i32, y as i32, w as i32, 2, 40, 40, 40);
+                            buffer.rect(x as i32, y as i32, filled, 2, r, g, b);
+                        }
+                    };
+                    draw_carry_bar(u.carry_wood, 80, 200, 80, &mut buffer, unit_draw_x, bar_y, bar_w);
+                    if u.carry_wood > 0.0 { bar_y -= 3.0; }
+                    draw_carry_bar(u.carry_stone, 170, 170, 170, &mut buffer, unit_draw_x, bar_y, bar_w);
+                    if u.carry_stone > 0.0 { bar_y -= 3.0; }
+                    draw_carry_bar(u.carry_gold, 240, 200, 40, &mut buffer, unit_draw_x, bar_y, bar_w);
+                    if u.carry_gold > 0.0 { bar_y -= 3.0; }
+                    draw_carry_bar(u.carry_food, 220, 140, 60, &mut buffer, unit_draw_x, bar_y, bar_w);
+                }
+
+                // Compact job indicator inside the unit
+                if u.job == UnitJob::Gathering {
+                    buffer.rect((unit_draw_x + w * 0.35) as i32, (unit_draw_y + w * 0.35) as i32, (w * 0.3) as i32, (w * 0.3) as i32, 255, 215, 0);
+                } else if u.job == UnitJob::Returning {
+                    buffer.rect((unit_draw_x + w * 0.35) as i32, (unit_draw_y + w * 0.35) as i32, (w * 0.3) as i32, (w * 0.3) as i32, 0, 200, 255);
+                }
+
                 // Health bar (Only if selected)
                 if u.selected {
                     let hp_ratio = (u.hp / if u.kind == UnitKind::Warrior.to_u8() { WARRIOR_HP } else { WORKER_HP }).clamp(0.0, 1.0);
-                    let bar_w = w;
+                    let bar_w = w + 2.0;
                     let filled = (bar_w * hp_ratio) as i32;
-                    buffer.rect((unit_draw_x) as i32, (unit_draw_y - 4.0) as i32, bar_w as i32, 3, 60, 20, 20);
-                    buffer.rect((unit_draw_x) as i32, (unit_draw_y - 4.0) as i32, filled, 3, 0, 200, 0);
+                    buffer.rect((unit_draw_x - 1.0) as i32, (unit_draw_y - 4.0) as i32, bar_w as i32, 4, 60, 20, 20);
+                    buffer.rect((unit_draw_x - 1.0) as i32, (unit_draw_y - 4.0) as i32, filled, 4, 0, 200, 0);
                 }
             }
         }
@@ -3201,6 +3578,9 @@ pub fn run_game() -> Result<(), JsValue> {
                         (BuildKind::House, (200u8, 180u8, 120u8)),
                         (BuildKind::Tower, (120u8, 120u8, 140u8)),
                         (BuildKind::Barracks, (180u8, 80u8, 80u8)),
+                        (BuildKind::LumberMill, (90u8, 130u8, 90u8)),
+                        (BuildKind::MiningCamp, (110u8, 110u8, 140u8)),
+                        (BuildKind::WheatMill, (210u8, 190u8, 130u8)),
                     ];
                         let menu_gap = 10.0; // uniform spacing with other vertical menus
                     // Background panel matching footer color, sized to fit options with top padding; bottom aligns to the build button
@@ -3244,7 +3624,7 @@ pub fn run_game() -> Result<(), JsValue> {
                          }
                          
                          // Tiny icon per type
-                         match kind {
+                        match kind {
                              BuildKind::Wall => {
                                  // Draw blue wall icon (centered)
                                  let icon_size = 20.0;
@@ -3275,6 +3655,18 @@ pub fn run_game() -> Result<(), JsValue> {
                              BuildKind::Barracks => {
                                  buffer.rect(18, (opt_y + 12.0) as i32, 24, 14, 190, 90, 90);
                                  buffer.rect(18, (opt_y + 10.0) as i32, 24, 4, 120, 60, 60);
+                            },
+                            BuildKind::LumberMill => {
+                                buffer.rect(18, (opt_y + 10.0) as i32, 24, 12, 100, 70, 40);
+                                buffer.rect(20, (opt_y + 24.0) as i32, 20, 6, 60, 120, 60);
+                            },
+                            BuildKind::MiningCamp => {
+                                buffer.rect(18, (opt_y + 14.0) as i32, 24, 10, 120, 120, 150);
+                                buffer.rect(20, (opt_y + 10.0) as i32, 20, 6, 80, 80, 110);
+                            },
+                            BuildKind::WheatMill => {
+                                buffer.rect(18, (opt_y + 12.0) as i32, 24, 14, 210, 190, 130);
+                                buffer.rect(26, (opt_y + 6.0) as i32, 8, 6, 230, 200, 150);
                              },
                          }
                      }
